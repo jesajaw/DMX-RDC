@@ -25,7 +25,7 @@ A small Tkinter GUI to control a DMX derby/laser fixture over a USB-DMX adapter 
 ## Installation
 
 ```bash
-git clone https://github.com/jesajaw/DMX-Razor-Derby-Controller
+git clone https://github.com/jesajaw/DMX-RDC
 cd DMX-Razor-Derby-Controller
 pip install -r requirements.txt
 ```
