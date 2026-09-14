@@ -22,20 +22,23 @@ import serial, serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk
 
+from music_window import MusicModeWindow
 
-# Theme — uncomment ONE block, comment out the others
-# dark grey / purple
-COLOR_BG = "#1e1e24"; COLOR_BG_LIGHT = "#2a2a33"; COLOR_FG = "#e0dff0"; COLOR = "#9b59d9"; COLOR_DARK = "#6c3fa0"; COLOR_STATUS_TEXT = "#c9a6f5"
+_SCHEMES = {
+    "dark_purple": dict(BG="#1e1e24", BG_LIGHT="#2a2a33", FG="#e0dff0", ACCENT="#9b59d9", ACCENT_DARK="#6c3fa0", STATUS_TEXT="#c9a6f5",),
+    "dark_blue": dict(BG="#1e1e24", BG_LIGHT="#2a2a33", FG="#e0dff0", ACCENT="#4a90d9", ACCENT_DARK="#2f5f9e", STATUS_TEXT="#a6c9f5",),
+    "black_white": dict(BG="#000000", BG_LIGHT="#1a1a1a", FG="#ffffff", ACCENT="#ffffff", ACCENT_DARK="#808080", STATUS_TEXT="#d9d9d9",),
+}
+COLOR_SCHEME = "dark_purple"
 
-# dark grey / blue
-# COLOR_BG = "#1e1e24"; COLOR_BG_LIGHT = "#2a2a33"; COLOR_FG = "#e0dff0"; COLOR = "#4a90d9"; COLOR_DARK = "#2f5f9e"; COLOR_STATUS_TEXT = "#a6c9f5"
+_active = _SCHEMES[COLOR_SCHEME]
+COLOR_BG = _active["BG"]
+COLOR_BG_LIGHT = _active["BG_LIGHT"]
+COLOR_FG = _active["FG"]
+COLOR = _active["ACCENT"]
+COLOR_DARK = _active["ACCENT_DARK"]
+COLOR_STATUS_TEXT = _active["STATUS_TEXT"]
 
-# black / white
-# COLOR_BG = "#000000"; COLOR_BG_LIGHT = "#1a1a1a"; COLOR_FG = "#ffffff"; COLOR = "#ffffff"; COLOR_DARK = "#808080"; COLOR_STATUS_TEXT = "#d9d9d9"
-
-
-# Fixed cell size so the layout never reflows when status text changes
-# (avoids jank while dragging sliders).
 CELL_WIDTH = 260
 CELL_HEIGHT = 90
 STATUS_LABEL_CHARS = 32
@@ -47,9 +50,8 @@ SEND_INTERVAL_S = 0.03  # ca. 33 Hz
 PRESETS_DIR = Path(__file__).parent / "presets" # used for json channel settings
 
 
-class DMXController:
-    """Wraps the serial DMX512 link to a USB-DMX adapter."""
-
+class Controller:
+    # wraps the serial DMX512 link to a USB-DMX adapter
     def __init__(self, port: str):
         self.ser = serial.Serial(
             port=port,
@@ -65,7 +67,7 @@ class DMXController:
             self.data[channel] = max(0, min(255, value))
 
     def send(self) -> None:
-        """Sends one DMX frame, including break / mark-after-break."""
+        # sends DMX frame, including break / mark-after-break
         self.ser.break_condition = True
         time.sleep(0.0001)
         self.ser.break_condition = False
@@ -73,7 +75,7 @@ class DMXController:
         self.ser.write(self.data)
 
     def stop(self) -> None:
-        """Zeroes all channels, sends once, then closes the port."""
+        # zeroes all channels, sends once, then closes the port
         for i in range(1, UNIVERSE_SIZE):
             self.data[i] = 0
         try:
@@ -83,9 +85,7 @@ class DMXController:
             pass
 
 
-class DMXGUI:
-    """Tkinter UI for the DMX Derby Controller."""
-
+class DMXUI:
     CHANNEL_NAMES = [
         "1: Show Select",
         "2: Speed",
@@ -101,10 +101,9 @@ class DMXGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("DMX Derby Controller")
-        self.root.geometry("850x525")
         self.root.configure(bg=COLOR_BG)
 
-        self.dmx: DMXController | None = None
+        self.dmx: Controller | None = None
         self.is_sending = False
         self.channel_labels: dict[int, ttk.Label] = {}
         self.sliders: dict[int, ttk.Scale] = {}
@@ -114,10 +113,9 @@ class DMXGUI:
         self._build_connection_bar()
         self._build_channel_grid()
         self._build_preset_bar()
+        self._size_to_content()
 
-# ------------------------------------------------------------
-# channel value -> readable state
-# ------------------------------------------------------------
+    # channel value -> readable state
     @staticmethod
     def describe(channel: int, value: int) -> str:
         if channel == 1:
@@ -179,9 +177,7 @@ class DMXGUI:
             return f"{value} | Rotation CCW"
         return f"{value}"
 
-# ------------------------------------------------------------
-# Styling
-# ------------------------------------------------------------
+    # --------- theme
     def _setup_style(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
@@ -207,9 +203,7 @@ class DMXGUI:
         style.configure("Status.TLabel", background=COLOR_BG_LIGHT, foreground=COLOR_STATUS_TEXT, font=("Consolas", 9))
         style.configure("CellTitle.TLabel", background=COLOR_BG_LIGHT, foreground=COLOR_FG, font=("Segoe UI", 9, "bold"))
 
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
+    # --------- UI
     def _build_connection_bar(self) -> None:
         bar = ttk.LabelFrame(self.root, text="Connection", padding=10)
         bar.pack(fill="x", padx=10, pady=5)
@@ -225,6 +219,7 @@ class DMXGUI:
 
         ttk.Button(bar, text="BLACKOUT", command=self.blackout,
                    style="Blackout.TButton").pack(side="right", padx=5)
+        ttk.Button(bar, text="🎵 Music Mode", command=self._open_music_mode).pack(side="right", padx=5)
 
     def _build_channel_grid(self) -> None:
         grid = ttk.LabelFrame(self.root, text="DMX Channels", padding=10)
@@ -271,9 +266,44 @@ class DMXGUI:
         ttk.Button(bar, text="Save As...", command=self.save_preset_as).pack(side="left", padx=5)
         ttk.Button(bar, text="Delete", command=self.delete_preset).pack(side="left", padx=5)
 
-# ------------------------------------------------------------
-# Sliders
-# ------------------------------------------------------------
+    def _open_music_mode(self) -> None:
+        channel_names = {ch: self.CHANNEL_NAMES[ch - 1] for ch in range(1, CHANNEL_COUNT + 1)}
+        window = MusicModeWindow(
+            self.root,
+            channel_names=channel_names,
+            set_channel_value=self._music_set_channel,
+            restore_sliders=self._music_restore_sliders,
+            on_closed=self._on_music_mode_closed,
+            colors=_active,
+        )
+        window.update_idletasks()
+        self.root.withdraw()
+
+    def _on_music_mode_closed(self) -> None:
+        self.root.deiconify()
+
+    def _music_set_channel(self, channel: int, value: int) -> None:
+        slider = self.sliders.get(channel)
+        if slider is None:
+            return
+        if str(slider.cget("state")) != "disabled":
+            slider.state(["disabled"])
+        slider.set(value)  # feuert on_slider_change -> Anzeige + dmx.set_channel
+
+    def _music_restore_sliders(self, channels: list[int]) -> None:
+        for channel in channels:
+            slider = self.sliders.get(channel)
+            if slider is not None:
+                slider.state(["!disabled"])
+
+    def _size_to_content(self) -> None:
+        self.root.update_idletasks()
+        width = self.root.winfo_reqwidth()
+        height = self.root.winfo_reqheight()
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(width, height)
+
+    # --------- Sliders
     def update_display(self, channel: int, value) -> None:
         val_int = int(float(value))
         self.channel_labels[channel].config(text=self.describe(channel, val_int))
@@ -284,9 +314,8 @@ class DMXGUI:
         if self.dmx:
             self.dmx.set_channel(channel, val_int)
 
-# ------------------------------------------------------------
-# Connection (non-blocking)
-# ------------------------------------------------------------
+
+    # --------- non-blocking connection
     def toggle_connection(self) -> None:
         if not self.is_sending:
             self.btn_connect.config(state="disabled")
@@ -298,14 +327,14 @@ class DMXGUI:
 
     def _connect_worker(self, port: str) -> None:
         try:
-            dmx = DMXController(port)
+            dmx = Controller(port)
             for channel, slider in self.sliders.items():
                 dmx.set_channel(channel, int(slider.get()))
             self.root.after(0, self._connect_success, dmx)
         except Exception as e:
             self.root.after(0, self._connect_failed, e, port)
 
-    def _connect_success(self, dmx: DMXController) -> None:
+    def _connect_success(self, dmx: Controller) -> None:
         self.dmx = dmx
         self.is_sending = True
         threading.Thread(target=self._send_loop, daemon=True).start()
@@ -322,8 +351,7 @@ class DMXGUI:
         show_error(self.root, "Connection Lost", f"DMX connection interrupted:\n{error}")
 
     def _send_loop(self) -> None:
-        """Background send cycle. Exits and reports on write failure
-        (e.g. adapter unplugged) instead of failing silently."""
+        # Background send cycle -- exits and reporst on write failure (unplug) instead of failing silently
         while self.is_sending:
             try:
                 self.dmx.send()
@@ -332,9 +360,8 @@ class DMXGUI:
                 return
             time.sleep(SEND_INTERVAL_S)
 
-# ------------------------------------------------------------
-# Actions
-# ------------------------------------------------------------
+
+    # --------- actions
     def refresh_preset_list(self, select: str | None = None) -> None:
         names = self.presets.list_presets()
         self.preset_cb["values"] = names
@@ -394,26 +421,21 @@ class DMXGUI:
         self.stop_dmx()
         self.root.destroy()
 
+# Reads & writes channel presets, one JSON file per preset, stored in a folder
 class PresetManager:
-    """Reads and writes channel presets, one JSON file per preset,
-    stored in a dedicated folder next to this script."""
-
     def __init__(self, directory: Path):
         self.directory = directory
         self.directory.mkdir(exist_ok=True)
 
-    def list_presets(self) -> list[str]:
-        """Returns preset names (without .json), sorted alphabetically."""
+    def list_presets(self) -> list[str]: # returns preset names (without .json), sorted alphabetically
         return sorted(p.stem for p in self.directory.glob("*.json"))
 
-    def save(self, name: str, values: dict[int, int]) -> None:
-        """Writes {channel: value} to <name>.json."""
+    def save(self, name: str, values: dict[int, int]) -> None: # writes {channel: value} to <name>.json
         path = self.directory / f"{name}.json"
         with path.open("w", encoding="utf-8") as f:
             json.dump(values, f, indent=2)
 
-    def load(self, name: str) -> dict[int, int]:
-        """Reads <name>.json back into {channel: value}."""
+    def load(self, name: str) -> dict[int, int]: # reads <name>.json back into {channel: value}
         path = self.directory / f"{name}.json"
         with path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -422,11 +444,9 @@ class PresetManager:
     def delete(self, name: str) -> None:
         (self.directory / f"{name}.json").unlink(missing_ok=True)
 
-# ------------------------------------------------------------
-# Themed popups caz the tkinter.messagebox / simpledialog are boring
-# ------------------------------------------------------------
+
 class ThemedDialog(tk.Toplevel):
-    """Modal popup styled to match the app's color theme."""
+    # Themed popups caz the tkinter.messagebox / simpledialog are boring
 
     def __init__(self, parent: tk.Tk, title: str, message: str, buttons: list[str], with_entry: bool = False):
         super().__init__(parent)
@@ -477,13 +497,9 @@ class ThemedDialog(tk.Toplevel):
 
 def show_error(parent: tk.Tk, title: str, message: str) -> None:
     ThemedDialog(parent, title, message, buttons=["OK"])
-
-
 def ask_yes_no(parent: tk.Tk, title: str, message: str) -> bool:
     dlg = ThemedDialog(parent, title, message, buttons=["Yes", "No"])
     return dlg.result == "Yes"
-
-
 def ask_string(parent: tk.Tk, title: str, message: str) -> str | None:
     dlg = ThemedDialog(parent, title, message, buttons=["OK", "Cancel"], with_entry=True)
     if dlg.result == "OK" and dlg.entry_value:
@@ -493,7 +509,7 @@ def ask_string(parent: tk.Tk, title: str, message: str) -> str | None:
 
 def main() -> None:
     root = tk.Tk()
-    app = DMXGUI(root)
+    app = DMXUI(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 
