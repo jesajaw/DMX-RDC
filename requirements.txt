@@ -2,4 +2,4 @@ pyserial>=3.5
 sounddevice>=0.4.6
 numpy>=1.26
 pillow>=10.0
-# winsdk>=1.0.0b10  # optional, nur fuer Titel/Cover in Music Mode (Windows-only)
+winsdk>=1.0.0b10  # optional, nur fuer Titel/Cover in Music Mode (Windows-only)

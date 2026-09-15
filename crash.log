@@ -1,5 +1,0 @@
-2026-09-16 00:42:20,998 ERROR Music Mode Audiofehler
-Traceback (most recent call last):
-  File "c:\Users\jesaj\git\DMX-RDC\musicmode.py", line 175, in start
-    wasapi_settings = sd.WasapiSettings(loopback=True)
-TypeError: WasapiSettings.__init__() got an unexpected keyword argument 'loopback'
