@@ -25,6 +25,8 @@ from tkinter import ttk
 import numpy as np
 import soundcard as sc
 import warnings
+import ctypes
+import sys
 warnings.filterwarnings("ignore", module="soundcard")
 
 SAMPLE_RATE = 48000
@@ -114,6 +116,7 @@ class DMXUI:
 
     def __init__(self, root: tk.Tk):
         self.root = root
+        apply_dark_titlebar(root)
         self.root.title("DMX Derby Controller")
         self.root.configure(bg=COLOR_BG)
 
@@ -585,6 +588,7 @@ class MusicModeWindow(tk.Toplevel):
         super().__init__(parent)
         self.title("Music Mode")
         self.colors = colors
+        apply_dark_titlebar(parent)
         self.configure(bg=colors["BG"])
         self.resizable(False, False)
 
@@ -734,6 +738,8 @@ class ThemedDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
+        force_dark_titlebar(self)
+
         self.result: str | None = None
         self.entry_value: str | None = None
 
@@ -785,10 +791,48 @@ def ask_string(parent: tk.Tk, title: str, message: str) -> str | None:
     return None
 
 
+# Windows-only visual fixes tkinter doesn't handle by itself: DPI awareness (fixes blurry/blocky text on HiDPI displays) and a dark title bar to match the theme. Both are no-ops on non-Windows.
+def _is_win() -> bool:
+    return sys.platform == "win32"
+
+def enable_dpi_awareness() -> None:
+    if not _is_win():
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # fallback for older Windows
+        except Exception:
+            pass
+
+def apply_dark_titlebar(window) -> None:
+    if not _is_win():
+        return
+    window.update_idletasks()
+    hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+    for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (Win10 2004+), 19 (older)
+        value = ctypes.c_int(1)
+        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value))
+        if result == 0:
+            break
+
+def force_dark_titlebar(window) -> None:
+        if not _is_win():
+            return
+        window.update()
+        try:
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+            rendering_policy = ctypes.c_int(2)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(rendering_policy), ctypes.sizeof(rendering_policy))
+        except Exception:
+            pass
+
+
 def main() -> None:
+    enable_dpi_awareness()
     root = tk.Tk()
-    app = DMXUI(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    root.protocol("WM_DELETE_WINDOW", DMXUI(root).on_close)
     root.mainloop()
 
 
