@@ -457,40 +457,7 @@ def ask_string(parent: tk.Tk, title: str, message: str) -> str | None:
     return None
 
 
-import logging
-import sys
-import faulthandler
-def _install_crash_logging() -> None:
-    """Schreibt jede unbehandelte Exception (Hauptthread, Hintergrund-Threads,
-    Tkinter-Callbacks) in crash.log neben diesem Skript. Ohne das verschwinden
-    Fehler spurlos, wenn die App ohne sichtbare Konsole gestartet wird (z.B.
-    Doppelklick/Verknuepfung statt Terminal)."""
-    log_path = Path(__file__).parent / "crash.log"
-    logging.basicConfig(
-        filename=log_path, level=logging.ERROR,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-    def log_main_thread_exception(exc_type, exc_value, exc_tb) -> None:
-        logging.error("Unbehandelte Exception im Hauptthread", exc_info=(exc_type, exc_value, exc_tb))
-
-    sys.excepthook = log_main_thread_exception
-
-    def log_worker_thread_exception(args: threading.ExceptHookArgs) -> None:
-        logging.error("Unbehandelte Exception in Thread %s", args.thread.name,
-                      exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-
-    threading.excepthook = log_worker_thread_exception
-
-    def log_tk_callback_exception(self, exc, val, tb) -> None:
-        logging.error("Unbehandelte Exception in Tkinter-Callback", exc_info=(exc, val, tb))
-
-    tk.Tk.report_callback_exception = log_tk_callback_exception
-
-
 def main() -> None:
-    faulthandler.enable(file=open(Path(__file__).parent / "faulthandler.log", "w"))
-    _install_crash_logging()
     enable_dpi_awareness()
     root = tk.Tk()
     root.protocol("WM_DELETE_WINDOW", DMXUI(root).on_close)

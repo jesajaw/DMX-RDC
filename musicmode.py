@@ -5,32 +5,31 @@ Music Mode
 Eigenes Fenster (MusicModeWindow), das die Systemsounds (WASAPI-Loopback des
 aktuellen Ausgabegeräts) in Echtzeit analysiert, als Spektrum + Oszilloskop
 visualisiert, Bass/Mid/Treble/Beat/Pitch auf DMX-Kanäle mappen kann und dazu
-optional (Windows) Titel/Cover des aktuell spielenden Tracks auf einer
-rotierenden Scheibe anzeigt.
+optional (Windows) Titel/Interpret des aktuell spielenden Tracks anzeigt.
 
 Das Hauptfenster (DMXUI) wird beim Öffnen versteckt (root.withdraw()) und dient
 nur noch als Backend: Verbindung/Send-Loop laufen unverändert weiter, Kanalwerte
 werden über die vom Hauptfenster übergebenen Callbacks gesetzt.
 
 Abhängigkeiten:
-    pip install sounddevice numpy pillow
-    pip install winsdk   # optional, nur fuer Titel/Cover (Windows-only)
+    pip install PyAudioWPatch numpy
+    pip install pywin32   # optional, nur fuer Titel/Interpret (Windows-only)
 
 Hinweis Plattform:
 - Windows: Loopback-Audio laeuft ohne weitere Einrichtung (WASAPI-Loopback des
-  Default-Ausgabegeraets, per sounddevice/PortAudio). Titel/Cover ebenfalls
-  nur unter Windows (winsdk).
+  Default-Ausgabegeraets, per PyAudioWPatch/PortAudio).
 - macOS/Linux: keine WASAPI-Loopback -- AudioAnalyzer.start() liefert dann
   einen Fehler (ueber on_frame(AudioFrame(error=...))), der Rest der UI
-  bleibt aber benutzbar. Kein Titel/Cover.
+  bleibt aber benutzbar. Kein Titel/Interpret.
 
-Die winsdk-Integration ist best-effort: die exakte Python-Projektion der
-WinRT-Medien-API kann sich je nach installierter winsdk-Version leicht
-unterscheiden (v.a. beim Auslesen der Thumbnail-Bytes). Schlaegt sie fehl,
-bleibt einfach Titel/Cover leer -- der Rest von Music Mode funktioniert normal.
+Die Titel/Interpret-Anzeige liest den Fenstertitel bekannter Media-Player-
+Prozesse aus (siehe KNOWN_PLAYER_PROCESSES) -- bewusst KEIN winsdk/winrt, da
+dieses Projekt archiviert ist. Vorteil: aktiv gepflegtes pywin32, keine
+Build-Toolchain noetig. Nachteil: kein Cover-Art moeglich, und das Format
+("Interpret - Titel") ist Player-abhaengig und nicht garantiert.
 
 Threading-Modell:
-- Die Audioaufnahme laeuft NICHT in einem eigenen Python-Thread: sounddevice
+- Die Audioaufnahme laeuft NICHT in einem eigenen Python-Thread: PyAudioWPatch
   (PortAudio) ruft AudioAnalyzer._audio_callback direkt aus seinem eigenen
   nativen Audio-Thread auf, sobald ein Block bereitsteht.
 - Now-Playing-Abfrage laeuft in einem eigenen Daemon-Thread (NowPlayingReader._loop)
@@ -39,7 +38,6 @@ Threading-Modell:
   GUI-Thread zurueck
 """
 
-import io
 import logging
 import threading
 import time
@@ -49,23 +47,15 @@ from dataclasses import dataclass
 from tkinter import ttk
 
 import numpy as np
-import sounddevice as sd
+import pyaudiowpatch as pyaudio
 
 from controller import apply_dark_titlebar
 
 try:
-    from PIL import Image, ImageDraw, ImageTk
-    _PIL_AVAILABLE = True
-except Exception:
-    _PIL_AVAILABLE = False
-
-try:
-    import asyncio
-
-    from winsdk.windows.media.control import (
-        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
-    )
-    from winsdk.windows.storage.streams import DataReader
+    import win32gui
+    import win32process
+    import win32api
+    import win32con
     _MEDIA_AVAILABLE = True
 except Exception:
     _MEDIA_AVAILABLE = False
@@ -115,7 +105,13 @@ BAR_CANVAS_HEIGHT = 120
 WAVE_CANVAS_WIDTH = 200
 WAVE_CANVAS_HEIGHT = 120
 DISC_SIZE = 150
-COVER_SIZE = 104
+
+# Bekannte Media-Player-Prozesse, deren Fenstertitel nach "Interpret - Titel"
+# durchsucht wird. Bei Bedarf einfach ergaenzen.
+KNOWN_PLAYER_PROCESSES = {
+    "spotify.exe", "vlc.exe", "foobar2000.exe", "wmplayer.exe",
+    "musicbee.exe", "itunes.exe", "winamp.exe", "aimp.exe",
+}
 
 
 @dataclass
@@ -141,11 +137,13 @@ class AudioAnalyzer:
     - bars: Spektrum in log-verteilten Baendern, fuers Balken-Display
     - waveform: kurzer Ausschnitt der Rohsamples, fuers Oszilloskop-Display
 
-    Nutzt sounddevice (PortAudio) mit WASAPI-Loopback: PortAudio ruft
-    _audio_callback direkt aus seinem eigenen nativen Audio-Thread auf, sobald
-    ein Block bereitsteht -- kein eigener threading.Thread noetig. (Vorher:
-    soundcard/soundcard-WASAPI, das auf manchen Geraeten mit
-    STATUS_HEAP_CORRUPTION abstuerzte.)
+    Nutzt PyAudioWPatch (dedizierter WASAPI-Loopback-Fork von PyAudio) statt
+    sounddevice: dessen WasapiSettings(loopback=True) existiert schlicht nicht
+    als High-Level-API -- das war ein Fehler meinerseits. PortAudio/PyAudio
+    ruft _audio_callback direkt aus seinem eigenen nativen Audio-Thread auf,
+    sobald ein Block bereitsteht -- kein eigener threading.Thread noetig.
+    (Davor: soundcard, das auf manchen Geraeten mit STATUS_HEAP_CORRUPTION
+    abstuerzte.)
     """
 
     def __init__(self, on_frame, blocksize: int = BLOCK_SIZE,
@@ -156,9 +154,11 @@ class AudioAnalyzer:
         self.smoothing = smoothing          # 0..~0.95, hoeher = traeger/ruhiger
         self.n_bars = n_bars
         self.samplerate = SAMPLE_RATE       # Platzhalter, wird in start() durchs echte Geraet ersetzt
+        self._channels = 2                  # Platzhalter, wird in start() durchs echte Geraet ersetzt
 
         self._running = False
-        self._stream: sd.InputStream | None = None
+        self._pa = None
+        self._stream = None
         self._levels = {"bass": 0.0, "mid": 0.0, "treble": 0.0}
         self._bar_levels = np.zeros(n_bars)
         self._bar_edges = np.geomspace(BAR_FREQ_RANGE[0], BAR_FREQ_RANGE[1], n_bars + 1)
@@ -171,51 +171,69 @@ class AudioAnalyzer:
         if self._running:
             return
         try:
-            device_index, samplerate, channels = self._resolve_loopback_device()
-            wasapi_settings = sd.WasapiSettings(loopback=True)
-            self._stream = sd.InputStream(
-                device=device_index, channels=channels, samplerate=samplerate,
-                blocksize=self.blocksize, dtype="float32",
-                extra_settings=wasapi_settings, callback=self._audio_callback,
+            self._pa = pyaudio.PyAudio()
+            device = self._resolve_loopback_device(self._pa)
+            self.samplerate = int(device["defaultSampleRate"])
+            self._channels = device["maxInputChannels"]
+            self._stream = self._pa.open(
+                format=pyaudio.paFloat32,
+                channels=self._channels,
+                rate=self.samplerate,
+                frames_per_buffer=self.blocksize,
+                input=True,
+                input_device_index=device["index"],
+                stream_callback=self._audio_callback,
             )
-            self._stream.start()
+            self._stream.start_stream()
         except Exception as e:
-            self._stream = None
+            self._cleanup()
             self.on_frame(AudioFrame(error=e))
             return
-        self.samplerate = samplerate
         self._running = True
 
     def stop(self) -> None:
         self._running = False
+        self._cleanup()
+
+    def _cleanup(self) -> None:
         if self._stream is not None:
             try:
-                self._stream.stop()
+                self._stream.stop_stream()
                 self._stream.close()
             except Exception:
                 pass
             self._stream = None
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
 
     @staticmethod
-    def _resolve_loopback_device() -> tuple[int, int, int]:
-        # Muss ueber die WASAPI-Hostapi laufen (nicht sd.default.device), sonst
-        # greift extra_settings=WasapiSettings(loopback=True) nicht
-        hostapis = sd.query_hostapis()
-        wasapi_idx = next((i for i, api in enumerate(hostapis) if api["name"] == "Windows WASAPI"), None)
-        if wasapi_idx is None:
-            raise RuntimeError("WASAPI-Hostapi nicht gefunden (kein Windows?)")
+    def _resolve_loopback_device(p) -> dict:
+        try:
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+        except OSError as e:
+            raise RuntimeError("WASAPI ist auf diesem System nicht verfuegbar") from e
 
-        output_idx = hostapis[wasapi_idx]["default_output_device"]
-        if output_idx is None or output_idx < 0:
-            raise RuntimeError("Kein WASAPI-Standardausgabegeraet gefunden")
+        default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+        if default_speakers["isLoopbackDevice"]:
+            return default_speakers
 
-        info = sd.query_devices(output_idx)
-        return output_idx, int(info["default_samplerate"]), info["max_output_channels"]
+        for loopback in p.get_loopback_device_info_generator():
+            if default_speakers["name"] in loopback["name"]:
+                return loopback
 
-    def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        raise RuntimeError("Kein passendes WASAPI-Loopback-Geraet gefunden")
+
+    def _audio_callback(self, in_data, frame_count, time_info, status):
         # Laeuft im nativen PortAudio-Thread, nicht in einem von uns gestarteten Thread
-        mono = indata.mean(axis=1) if indata.ndim > 1 else indata
-        self._process(mono)
+        samples = np.frombuffer(in_data, dtype=np.float32)
+        if self._channels > 1:
+            samples = samples.reshape(-1, self._channels).mean(axis=1)
+        self._process(samples)
+        return (None, pyaudio.paContinue)
 
     def _process(self, samples: np.ndarray) -> None:
         window = self._window if len(samples) == len(self._window) else np.hanning(len(samples))
@@ -260,18 +278,65 @@ class AudioAnalyzer:
         ))
 
 
+def _get_process_name(pid: int) -> str:
+    try:
+        handle = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ, False, pid)
+        try:
+            path = win32process.GetModuleFileNameEx(handle, 0)
+            return path.rsplit("\\", 1)[-1].lower()
+        finally:
+            win32api.CloseHandle(handle)
+    except Exception:
+        return ""
+
+
+def _find_now_playing_title() -> str | None:
+    """Sucht unter den sichtbaren Top-Level-Fenstern eines bekannten Media-Players
+    (KNOWN_PLAYER_PROCESSES) und gibt dessen Fenstertitel zurueck, oder None."""
+    found = []
+
+    def _callback(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = win32gui.GetWindowText(hwnd)
+        if not title:
+            return
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            return
+        if _get_process_name(pid) in KNOWN_PLAYER_PROCESSES:
+            found.append(title)
+
+    try:
+        win32gui.EnumWindows(_callback, None)
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
+def _parse_title(raw: str) -> tuple[str, str]:
+    # Gaengiges Format vieler Player: "Interpret - Titel"
+    if " - " in raw:
+        artist, _, title = raw.partition(" - ")
+        return artist.strip(), title.strip()
+    return "", raw.strip()
+
+
 class NowPlayingReader:
-    """Liest Titel/Interpret/Cover der aktuell unter Windows spielenden Medien-Session
-    ueber die WinRT GlobalSystemMediaTransportControlsSessionManager-API (winsdk-Paket).
-    Windows-only und best-effort: ohne winsdk oder bei API-Aenderungen bleibt sie inaktiv,
-    on_update wird dann einfach nie aufgerufen."""
+    """Liest Titel/Interpret aus dem Fenstertitel bekannter Media-Player-Prozesse
+    (siehe KNOWN_PLAYER_PROCESSES), z.B. "Interpret - Titel" bei Spotify.
+    Windows-only, kein Cover-Art moeglich mit diesem Ansatz, und das Format ist
+    Player-abhaengig -- daf uer aber komplett ohne winsdk/winrt (siehe Docstring
+    oben). Ohne pywin32 bleibt sie inaktiv, on_update wird dann nie aufgerufen."""
 
     def __init__(self, on_update, poll_interval: float = 2.0):
-        self.on_update = on_update  # callback(title: str, artist: str, cover_bytes: bytes | None)
+        self.on_update = on_update  # callback(title: str, artist: str)
         self.poll_interval = poll_interval
         self._running = False
         self._thread = None
-        self._last_key = None
+        self._last_raw = None
 
     def start(self) -> None:
         if not _MEDIA_AVAILABLE or self._running:
@@ -285,46 +350,16 @@ class NowPlayingReader:
 
     def _loop(self) -> None:
         while self._running:
-            try:
-                result = asyncio.run(self._fetch())
-            except Exception:
-                result = None
-            if result is not None:
-                title, artist, cover_bytes = result
-                key = (title, artist)
-                if key != self._last_key:
-                    self._last_key = key
-                    self.on_update(title, artist, cover_bytes)
+            raw = _find_now_playing_title()
+            if raw and raw != self._last_raw:
+                self._last_raw = raw
+                artist, title = _parse_title(raw)
+                self.on_update(title, artist)
             time.sleep(self.poll_interval)
-
-    async def _fetch(self):
-        manager = await MediaManager.request_async()
-        session = manager.get_current_session()
-        if session is None:
-            return None
-        props = await session.try_get_media_properties_async()
-        title = props.title or ""
-        artist = props.artist or ""
-
-        cover_bytes = None
-        thumb_ref = props.thumbnail
-        if thumb_ref is not None:
-            try:
-                stream = await thumb_ref.open_read_async()
-                size = stream.size
-                reader = DataReader(stream)
-                await reader.load_async(size)
-                buf = bytearray(size)
-                reader.read_bytes(buf)
-                cover_bytes = bytes(buf)
-            except Exception:
-                cover_bytes = None
-
-        return title, artist, cover_bytes
 
 
 class MusicModeWindow(tk.Toplevel):
-    """Eigenstaendiges Fenster: Spektrum + Oszilloskop, rotierende Cover-Scheibe,
+    """Eigenstaendiges Fenster: Spektrum + Oszilloskop, Scheibe mit Titel/Interpret,
     Kanal-Mapping (mit Empfehlungs-Markierung) und Start/Stop-Settings."""
 
     def __init__(self, parent: tk.Tk, channel_names: dict, set_channel_value,
@@ -395,24 +430,18 @@ class MusicModeWindow(tk.Toplevel):
         for r in range(int(DISC_SIZE / 2) - 8, 24, -12):
             self.disc_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
                                           outline=colors["ACCENT_DARK"], width=1)
-        self._cover_image_item = self.disc_canvas.create_image(cx, cy, image=None)
-        self._cover_photo = None   # Referenz halten, sonst raeumt Tkinter das Bild weg
-        self._base_cover = None    # zirkulaer maskiertes, ungedrehtes PIL-Image
-        self._disc_angle = 0.0
+        self.disc_canvas.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
+                                      fill=colors["ACCENT"], outline="")
 
         self.track_label = ttk.Label(parent, text="", font=("Segoe UI", 9, "bold"),
                                       wraplength=DISC_SIZE + 20, justify="center")
         self.track_label.pack(pady=(5, 0))
 
-        if not _PIL_AVAILABLE:
-            self.track_label.config(text="(Pillow fehlt -> kein Cover)")
-        elif not _MEDIA_AVAILABLE:
-            self.track_label.config(text="(winsdk fehlt -> kein Titel/Cover)")
+        if not _MEDIA_AVAILABLE:
+            self.track_label.config(text="(pywin32 fehlt -> kein Titel)")
         else:
             self.now_playing = NowPlayingReader(on_update=self._on_now_playing)
             self.now_playing.start()
-
-        self._spin_disc()
 
     def _build_plots(self, parent: ttk.Frame) -> None:
         colors = self.colors
@@ -558,35 +587,13 @@ class MusicModeWindow(tk.Toplevel):
             points.extend((x, y))
         self.wave_canvas.coords(self._wave_line, *points)
 
-    # --------- Now Playing / Cover-Scheibe
-    def _spin_disc(self) -> None:
-        if not self.winfo_exists():
-            return
-        self._disc_angle = (self._disc_angle - 4) % 360
-        if _PIL_AVAILABLE and self._base_cover is not None:
-            rotated = self._base_cover.rotate(self._disc_angle, resample=Image.BICUBIC)
-            self._cover_photo = ImageTk.PhotoImage(rotated)
-            self.disc_canvas.itemconfig(self._cover_image_item, image=self._cover_photo)
-        self.after(80, self._spin_disc)
+    # --------- Now Playing
+    def _on_now_playing(self, title: str, artist: str) -> None:
+        self.after(0, self._apply_now_playing, title, artist)
 
-    def _on_now_playing(self, title: str, artist: str, cover_bytes) -> None:
-        self.after(0, self._apply_now_playing, title, artist, cover_bytes)
-
-    def _apply_now_playing(self, title: str, artist: str, cover_bytes) -> None:
+    def _apply_now_playing(self, title: str, artist: str) -> None:
         text = f"{title}\n{artist}" if artist else (title or "")
         self.track_label.config(text=text)
-
-        if not (_PIL_AVAILABLE and cover_bytes):
-            return
-        try:
-            img = Image.open(io.BytesIO(cover_bytes)).convert("RGBA")
-            img = img.resize((COVER_SIZE, COVER_SIZE), Image.LANCZOS)
-            mask = Image.new("L", (COVER_SIZE, COVER_SIZE), 0)
-            ImageDraw.Draw(mask).ellipse((0, 0, COVER_SIZE, COVER_SIZE), fill=255)
-            img.putalpha(mask)
-            self._base_cover = img
-        except Exception:
-            self._base_cover = None
 
     # --------- Schliessen
     def _on_close(self) -> None:

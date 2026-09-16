@@ -1,7 +1,4 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
+# Python (Build-Artefakte, kein __pycache__)
 *.egg-info/
 build/
 dist/
@@ -18,6 +15,3 @@ env/
 # OS
 .DS_Store
 Thumbs.db
-
-# Lokale, nutzerspezifische DMX-Presets
-presets/
