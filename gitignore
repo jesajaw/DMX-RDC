@@ -1,7 +1,8 @@
 # Python (Build-Artefakte, kein __pycache__)
-*.egg-info/
-build/
-dist/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
 
 # Virtuelle Umgebungen
 .venv/
