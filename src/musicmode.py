@@ -39,6 +39,7 @@ Threading-Modell:
 """
 
 import logging
+import math
 import threading
 import time
 import tkinter as tk
@@ -49,7 +50,7 @@ from tkinter import ttk
 import numpy as np
 import pyaudiowpatch as pyaudio
 
-from controller import apply_dark_titlebar
+from .controller import apply_dark_titlebar
 
 try:
     import win32gui
@@ -78,33 +79,25 @@ BAND_RANGES = {
     "treble": (4000, 16000),
 }
 
-# Kanal-Kategorien: welcher DMX-Kanal ist fuer welche Art von Steuerung gedacht
-CHANNEL_CATEGORIES = {
-    1: "mode",     # Show Select
-    2: "speed",    # Speed
-    3: "color",    # Derby Color
-    4: "strobe",   # Derby Strobe
-    5: "speed",    # Derby Motor
-    6: "pattern",  # Pattern
-    7: "mode",     # Laser Mode
-    8: "strobe",   # Laser Strobe
-    9: "speed",    # Laser Rotation
-}
-
+# Music-Mode-Quellen, die auf DMX-Kanäle gemappt werden können
 SOURCES = ("bass", "mid", "treble", "beat", "pitch")
-SOURCE_INFO = {
-    "bass":   {"label": "Bass",   "hint": "empfohlen: Farbe/Pattern",   "recommended": {"color", "pattern"}},
-    "mid":    {"label": "Mid",    "hint": "empfohlen: Farbe/Pattern",   "recommended": {"color", "pattern"}},
-    "treble": {"label": "Treble", "hint": "empfohlen: Farbe/Pattern",   "recommended": {"color", "pattern"}},
-    "beat":   {"label": "Beat",   "hint": "empfohlen: Strobe",          "recommended": {"strobe"}},
-    "pitch":  {"label": "Pitch",  "hint": "empfohlen: Speed/Rotation",  "recommended": {"speed"}},
+SOURCE_LABELS = {
+    "bass": "Bass", "mid": "Mid", "treble": "Treble", "beat": "Beat", "pitch": "Pitch",
 }
 
-BAR_CANVAS_WIDTH = 260
-BAR_CANVAS_HEIGHT = 120
-WAVE_CANVAS_WIDTH = 200
-WAVE_CANVAS_HEIGHT = 120
+# Spectrum/Waveform bewusst gleich gross, damit sie symmetrisch nebeneinander sitzen
+BAR_CANVAS_WIDTH = 280
+BAR_CANVAS_HEIGHT = 150
+WAVE_CANVAS_WIDTH = 280
+WAVE_CANVAS_HEIGHT = 150
 DISC_SIZE = 150
+
+# Pixel-Art-"Label" auf der Scheibe (Ersatz fuer echtes Cover-Art, siehe Docstring)
+PIXEL_DOT_COUNT = 8
+PIXEL_DOT_RADIUS = 22
+PIXEL_DOT_SIZE = 6
+SPIN_STEP_DEG = 6
+SPIN_INTERVAL_MS = 80
 
 # Bekannte Media-Player-Prozesse, deren Fenstertitel nach "Interpret - Titel"
 # durchsucht wird. Bei Bedarf einfach ergaenzen.
@@ -359,8 +352,8 @@ class NowPlayingReader:
 
 
 class MusicModeWindow(tk.Toplevel):
-    """Eigenstaendiges Fenster: Spektrum + Oszilloskop, Scheibe mit Titel/Interpret,
-    Kanal-Mapping (mit Empfehlungs-Markierung) und Start/Stop-Settings."""
+    """Eigenstaendiges Fenster: Spektrum + Oszilloskop nebeneinander, Scheibe mit
+    Titel/Interpret darunter, Kanal-Mapping und Start/Stop-Settings."""
 
     def __init__(self, parent: tk.Tk, channel_names: dict, set_channel_value,
                  restore_sliders, on_closed, colors: dict):
@@ -402,13 +395,13 @@ class MusicModeWindow(tk.Toplevel):
         viz = ttk.LabelFrame(self, text="Now Playing", padding=10)
         viz.pack(fill="x", padx=10, pady=(10, 5))
 
-        disc_col = ttk.Frame(viz)
-        disc_col.pack(side="left", padx=(0, 15))
-        self._build_disc(disc_col)
+        plots_row = ttk.Frame(viz)
+        plots_row.pack()
+        self._build_plots(plots_row)
 
-        plots_col = ttk.Frame(viz)
-        plots_col.pack(side="left", fill="both", expand=True)
-        self._build_plots(plots_col)
+        disc_row = ttk.Frame(viz)
+        disc_row.pack(pady=(12, 0))
+        self._build_disc(disc_row)
 
         self._build_mapping()
         self._build_settings()
@@ -430,8 +423,17 @@ class MusicModeWindow(tk.Toplevel):
         for r in range(int(DISC_SIZE / 2) - 8, 24, -12):
             self.disc_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
                                           outline=colors["ACCENT_DARK"], width=1)
-        self.disc_canvas.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
-                                      fill=colors["ACCENT"], outline="")
+
+        # Kleine rotierende Pixel-Art-Punkte als "Label" der Schallplatte -- echtes
+        # Cover-Art ist ohne winsdk/winrt nicht verfuegbar (siehe Modul-Docstring)
+        self._pixel_ids = []
+        for i in range(PIXEL_DOT_COUNT):
+            color = colors["ACCENT"] if i % 2 == 0 else colors["ACCENT_DARK"]
+            dot_id = self.disc_canvas.create_rectangle(0, 0, 0, 0, fill=color, outline="")
+            self._pixel_ids.append(dot_id)
+        self.disc_canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
+                                      fill=colors["FG"], outline="")
+        self._disc_angle = 0.0
 
         self.track_label = ttk.Label(parent, text="", font=("Segoe UI", 9, "bold"),
                                       wraplength=DISC_SIZE + 20, justify="center")
@@ -443,13 +445,31 @@ class MusicModeWindow(tk.Toplevel):
             self.now_playing = NowPlayingReader(on_update=self._on_now_playing)
             self.now_playing.start()
 
+        self._spin_disc()
+
+    def _spin_disc(self) -> None:
+        if not self.winfo_exists():
+            return
+        self._disc_angle = (self._disc_angle + SPIN_STEP_DEG) % 360
+        cx = cy = DISC_SIZE / 2
+        count = len(self._pixel_ids)
+        for i, dot_id in enumerate(self._pixel_ids):
+            angle = math.radians(self._disc_angle + i * (360 / count))
+            x = cx + PIXEL_DOT_RADIUS * math.cos(angle)
+            y = cy + PIXEL_DOT_RADIUS * math.sin(angle)
+            half = PIXEL_DOT_SIZE / 2
+            self.disc_canvas.coords(dot_id, x - half, y - half, x + half, y + half)
+        self.after(SPIN_INTERVAL_MS, self._spin_disc)
+
     def _build_plots(self, parent: ttk.Frame) -> None:
         colors = self.colors
 
-        ttk.Label(parent, text="Spectrum", style="CellTitle.TLabel").pack(anchor="w")
-        self.bar_canvas = tk.Canvas(parent, width=BAR_CANVAS_WIDTH, height=BAR_CANVAS_HEIGHT,
+        spectrum_col = ttk.Frame(parent)
+        spectrum_col.pack(side="left", padx=(0, 15))
+        ttk.Label(spectrum_col, text="Spectrum", style="CellTitle.TLabel").pack(anchor="w")
+        self.bar_canvas = tk.Canvas(spectrum_col, width=BAR_CANVAS_WIDTH, height=BAR_CANVAS_HEIGHT,
                                      bg=colors["BG_LIGHT"], highlightthickness=0)
-        self.bar_canvas.pack(pady=(0, 5))
+        self.bar_canvas.pack()
         bar_width = BAR_CANVAS_WIDTH / N_BARS
         for i in range(N_BARS):
             x0 = i * bar_width + 2
@@ -458,8 +478,10 @@ class MusicModeWindow(tk.Toplevel):
                 x0, BAR_CANVAS_HEIGHT, x1, BAR_CANVAS_HEIGHT, fill=colors["ACCENT"], width=0)
             self._bar_ids.append(bar_id)
 
-        ttk.Label(parent, text="Waveform", style="CellTitle.TLabel").pack(anchor="w")
-        self.wave_canvas = tk.Canvas(parent, width=WAVE_CANVAS_WIDTH, height=WAVE_CANVAS_HEIGHT,
+        wave_col = ttk.Frame(parent)
+        wave_col.pack(side="left")
+        ttk.Label(wave_col, text="Waveform", style="CellTitle.TLabel").pack(anchor="w")
+        self.wave_canvas = tk.Canvas(wave_col, width=WAVE_CANVAS_WIDTH, height=WAVE_CANVAS_HEIGHT,
                                       bg=colors["BG_LIGHT"], highlightthickness=0)
         self.wave_canvas.pack()
         mid_y = WAVE_CANVAS_HEIGHT / 2
@@ -470,23 +492,20 @@ class MusicModeWindow(tk.Toplevel):
         mapping = ttk.LabelFrame(self, text="Channel Mapping", padding=10)
         mapping.pack(fill="x", padx=10, pady=5)
 
+        options = ["None"] + [self.channel_names[c] for c in sorted(self.channel_names)]
         for source in SOURCES:
-            info = SOURCE_INFO[source]
             row = ttk.Frame(mapping)
             row.pack(fill="x", pady=2)
-            ttk.Label(row, text=info["label"], width=8).pack(side="left")
+            ttk.Label(row, text=SOURCE_LABELS[source], width=8).pack(side="left")
 
             var = tk.StringVar(value="None")
             self.mapping_vars[source] = var
-            cb = ttk.Combobox(row, values=self._options_for(source), textvariable=var,
-                               width=24, state="readonly")
+            cb = ttk.Combobox(row, values=options, textvariable=var, width=24, state="readonly")
             cb.pack(side="left", padx=5)
 
-            meter = ttk.Progressbar(row, orient="horizontal", length=90, maximum=100)
+            meter = ttk.Progressbar(row, orient="horizontal", length=120, maximum=100)
             meter.pack(side="left", padx=5, fill="x", expand=True)
             self.meters[source] = meter
-
-            ttk.Label(row, text=info["hint"], style="Status.TLabel").pack(side="left", padx=5)
 
     def _build_settings(self) -> None:
         settings = ttk.LabelFrame(self, text="Settings", padding=10)
@@ -504,23 +523,10 @@ class MusicModeWindow(tk.Toplevel):
         self.smooth_scale.set(self.analyzer.smoothing)
         self.smooth_scale.pack(side="left", padx=5, fill="x", expand=True)
 
-    # --------- Mapping-Optionen mit Empfehlungs-Markierung
-    def _options_for(self, source: str) -> list:
-        recommended = SOURCE_INFO[source]["recommended"]
-        starred, rest = [], []
-        for ch in sorted(self.channel_names):
-            label = self.channel_names[ch]
-            if CHANNEL_CATEGORIES.get(ch) in recommended:
-                starred.append(f"\u2605 {label}")
-            else:
-                rest.append(label)
-        return ["None", *starred, *rest]
-
     def _channel_for(self, source: str):
         label = self.mapping_vars[source].get()
         if label == "None":
             return None
-        label = label.removeprefix("\u2605 ")
         for ch, name in self.channel_names.items():
             if name == label:
                 return ch

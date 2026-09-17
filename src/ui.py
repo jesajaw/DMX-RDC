@@ -27,9 +27,8 @@ import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk
 
-from controller import Controller, PresetManager, SEND_INTERVAL_S, \
-    enable_dpi_awareness, apply_dark_titlebar, force_dark_titlebar
-from musicmode import MusicModeWindow
+from .controller import Controller, PresetManager, SEND_INTERVAL_S, enable_dpi_awareness, apply_dark_titlebar, force_dark_titlebar
+from .musicmode import MusicModeWindow
 
 _SCHEMES = {
     "dark_purple": dict(BG="#1e1e24", BG_LIGHT="#2a2a33", FG="#e0dff0", ACCENT="#9b59d9", ACCENT_DARK="#6c3fa0", STATUS_TEXT="#c9a6f5",),
@@ -52,7 +51,7 @@ STATUS_LABEL_CHARS = 32
 
 CHANNEL_COUNT = 9
 
-PRESETS_DIR = Path(__file__).parent / "presets" # used for json channel settings
+PRESETS_DIR = Path(__file__).resolve().parent.parent / "presets" # used for json channel settings
 
 
 class DMXUI:
@@ -164,6 +163,12 @@ class DMXUI:
 
         style.configure("TCombobox", fieldbackground=COLOR_BG_LIGHT, background=COLOR_BG_LIGHT, foreground=COLOR_FG, arrowcolor=COLOR)
         style.map("TCombobox", fieldbackground=[("readonly", COLOR_BG_LIGHT)])
+        # Das aufklappende Popup-Listbox einer Combobox ist ein natives Tk-Listbox-
+        # Widget, kein ttk-Widget -- style.configure greift dort nicht, nur option_add
+        self.root.option_add("*TCombobox*Listbox.background", COLOR_BG_LIGHT)
+        self.root.option_add("*TCombobox*Listbox.foreground", COLOR_FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", COLOR_DARK)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", COLOR_FG)
         style.configure("Horizontal.TScale", background=COLOR_BG, troughcolor=COLOR_BG_LIGHT)
         style.configure("TEntry", fieldbackground=COLOR_BG_LIGHT, foreground=COLOR_FG,insertcolor=COLOR_FG)
 
