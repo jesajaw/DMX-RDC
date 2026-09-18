@@ -5,7 +5,7 @@ from pathlib import Path
 class parameters:
     UNIVERSE_SIZE = 513  # channel 0 unused, DMX starts at 1
     SEND_INTERVAL_S = 0.03  # ca. 33 Hz
-    SAMPLE_RATE = 48000                  # Platzhalter, wird beim Start durchs echte Geraet ersetzt
+    SAMPLE_RATE = 48000
     BLOCK_SIZE = 1024
     N_BARS = 24
     WAVE_POINTS = 160

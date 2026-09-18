@@ -1,6 +1,6 @@
 # DMX Derby Controller
 
-A small Tkinter GUI to control a DMX derby/laser fixture over a USB-DMX adapter — one slider per channel, live plain-text readout of what each value actually does, and a blackout button.
+A small UI to control a DMX derby/laser fixture over a USB-DMX adapter — one slider per channel, live plain-text readout of what each value actually does, Blackout and Music Mode.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -8,39 +8,43 @@ A small Tkinter GUI to control a DMX derby/laser fixture over a USB-DMX adapter 
 ## Features
 
 - One slider per DMX channel (9-channel mode), each showing a description of the current value (e.g. `114 | Derby + Laser`) instead of a raw number.
-- Non-blocking connect: opening the serial port runs in a background thread, so the GUI never freezes while connecting.
-- Detects connection loss (e.g. adapter unplugged) during operation and reports it instead of failing silently.
+- Non-blocking connect, detects connection loss (e.g. adapter unplugged)
 - One-click blackout
 - Three selectable color themes (purple / blue / black-white) via a config toggle at the top of the file.
 
 ## Todo
-- Music Mode: pyaudiowpatch -> FFT numpy -> Bass/Mid/Treble
-
+- Music Mode
 
 ## Requirements
 
-- Python 3.10+ as installed through [requirements.txt](requirements.txt)
-- A USB-DMX adapter that shows up as a serial (COM) port
+- python 3.10+
+- pyserial 3.5+
+- PyAudioWPatch 0.2.12+
+- numpy 1.26+
+- pywin32 306+ (should be optional for Music title and cover)
+
+Installation is done via the [requirements.txt](requirements.txt) file. You will need a USB-DMX adapter that is recognized as a serial (COM) port.
 
 ## Installation
 
 ```bash
 git clone https://github.com/jesajaw/DMX-RDC
-cd DMX-Razor-Derby-Controller
+cd DMX-RDC # or the folder you selected
 pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
-python DMX-Controller.py
+python main.py
 ```
 
 1. Select the COM port your USB-DMX adapter is connected to.
 2. Click **Connect**.
 3. Move the sliders — changes are sent continuously (~33 Hz) while connected
 4. **BLACKOUT** sets all channels to 0 immediately.
-5. **Disconnect** stops sending and closes the port.
+5. **Music Mode** takes you to a mode optimized for music, where you can set up lighting effects that sync with your music.
+6. **Disconnect** stops sending and closes the port.
 
 ## Presets
 
