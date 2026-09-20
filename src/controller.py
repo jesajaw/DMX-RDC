@@ -20,6 +20,8 @@ from pathlib import Path
 
 import serial
 
+from .config import parameters
+
 _user32 = ctypes.windll.user32
 _dwmapi = ctypes.windll.dwmapi
 
@@ -28,9 +30,6 @@ _user32.GetParent.restype = wintypes.HWND
 
 _dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
-
-UNIVERSE_SIZE = 513  # channel 0 unused, DMX starts at 1
-SEND_INTERVAL_S = 0.03  # ca. 33 Hz
 
 
 class Controller:
@@ -43,7 +42,7 @@ class Controller:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_TWO,
         )
-        self.data = bytearray(UNIVERSE_SIZE)
+        self.data = bytearray(parameters.UNIVERSE_SIZE)
 
     def set_channel(self, channel: int, value: int) -> None:
         if 1 <= channel <= 512:
@@ -59,7 +58,7 @@ class Controller:
 
     def stop(self) -> None:
         # zeroes all channels, sends once, then closes the port
-        for i in range(1, UNIVERSE_SIZE):
+        for i in range(1, parameters.UNIVERSE_SIZE):
             self.data[i] = 0
         try:
             self.send()

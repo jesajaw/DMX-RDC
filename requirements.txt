@@ -1,4 +1,5 @@
 pyserial>=3.5
 PyAudioWPatch>=0.2.12
 numpy>=1.26
-pywin32>=306  # optional, nur fuer Titel/Interpret in Music Mode (Windows-only)
+pillow>=10.0  # für Cover-Art-Rendering (Kreis-Maske, Rotation) in Music Mode
+pywin32>=306  # optional, nur Fallback für Titel/Interpret ohne NowPlayingBridge.exe (Windows-only)

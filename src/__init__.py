@@ -1,2 +1,2 @@
-from . import controller, musicmode, ui
-__all__ = ["controller", "musicmode", "ui"]
+from . import config, controller, musicmode, ui
+__all__ = ["config", "controller", "musicmode", "ui"]

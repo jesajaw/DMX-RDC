@@ -41,7 +41,7 @@ python main.py
 
 1. Select the COM port your USB-DMX adapter is connected to.
 2. Click **Connect**.
-3. Move the sliders — changes are sent continuously (~33 Hz) while connected
+3. Move the sliders — changes are sent continuously while connected
 4. **BLACKOUT** sets all channels to 0 immediately.
 5. **Music Mode** takes you to a mode optimized for music, where you can set up lighting effects that sync with your music.
 6. **Disconnect** stops sending and closes the port.
@@ -51,10 +51,10 @@ python main.py
 Channel setups can be saved and reloaded as presets, stored as individual JSON files in the `presets/` folder (created automatically on first run).
 
 - **Save As...** — stores the current slider values under a name you choose
-- **Load** — applies the selected preset's values to all sliders (and live DMX output, if connected)
+- **Load** — applies the selected preset's values to all sliders
 - **Delete** — removes the selected preset
 
-Each preset is a plain JSON file (`presets/<name>.json`), so they can be copied, renamed, or shared individually:
+Each preset is a plain JSON file: `presets/<name>.json`:
 
 ```json
 {

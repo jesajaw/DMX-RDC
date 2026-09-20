@@ -5,10 +5,15 @@ DMX Derby Controller
 Tkinter GUI to control a Razor Derby over a USB-DMX adapter
 (RS485, 250000 baud, 2 stop bits).
 
-Aufgeteilt in drei Dateien:
+Aufgeteilt in vier Dateien:
+- config.py:     zentrale parameters-Klasse, einzige Quelle aller Konstanten
 - controller.py: DMX-Serial-Controller, Preset-Persistenz, Windows-Plattform-Helfer
 - musicmode.py:  Audioanalyse + Music-Mode-Fenster
-- ui.py (diese Datei): Theme/Farbschema, Hauptfenster (DMXUI), Dialoge, Einstiegspunkt
+- ui.py (diese Datei): Theme/Farbschema, Hauptfenster (DMXUI), Dialoge
+
+Der Einstiegspunkt liegt NICHT hier, sondern in main.py im Projekt-Root --
+diese Datei stellt nur DMXUI (und die Dialog-Helfer) bereit, ohne selbst
+Tk-Root/Mainloop zu starten.
 
 Threading model
 ----------------
@@ -21,63 +26,28 @@ Threading model
 import json
 import threading
 import time
-from pathlib import Path
 
 import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk
 
-from .controller import Controller, PresetManager, SEND_INTERVAL_S, enable_dpi_awareness, apply_dark_titlebar, force_dark_titlebar
+from .config import parameters
+from .controller import Controller, PresetManager, apply_dark_titlebar, force_dark_titlebar
 from .musicmode import MusicModeWindow
-
-_SCHEMES = {
-    "dark_purple": dict(BG="#1e1e24", BG_LIGHT="#2a2a33", FG="#e0dff0", ACCENT="#9b59d9", ACCENT_DARK="#6c3fa0", STATUS_TEXT="#c9a6f5",),
-    "dark_blue": dict(BG="#1e1e24", BG_LIGHT="#2a2a33", FG="#e0dff0", ACCENT="#4a90d9", ACCENT_DARK="#2f5f9e", STATUS_TEXT="#a6c9f5",),
-    "black_white": dict(BG="#000000", BG_LIGHT="#1a1a1a", FG="#ffffff", ACCENT="#ffffff", ACCENT_DARK="#808080", STATUS_TEXT="#d9d9d9",),
-}
-COLOR_SCHEME = "dark_purple"
-
-_active = _SCHEMES[COLOR_SCHEME]
-COLOR_BG = _active["BG"]
-COLOR_BG_LIGHT = _active["BG_LIGHT"]
-COLOR_FG = _active["FG"]
-COLOR = _active["ACCENT"]
-COLOR_DARK = _active["ACCENT_DARK"]
-COLOR_STATUS_TEXT = _active["STATUS_TEXT"]
-
-CELL_WIDTH = 260
-CELL_HEIGHT = 90
-STATUS_LABEL_CHARS = 32
-
-CHANNEL_COUNT = 9
-
-PRESETS_DIR = Path(__file__).resolve().parent.parent / "presets" # used for json channel settings
 
 
 class DMXUI:
-    CHANNEL_NAMES = [
-        "1: Show Select",
-        "2: Speed",
-        "3: Derby Color",
-        "4: Derby Strobe",
-        "5: Derby Motor",
-        "6: Pattern",
-        "7: Laser Mode",
-        "8: Laser Strobe",
-        "9: Laser Rotation",
-    ]
-
     def __init__(self, root: tk.Tk):
         self.root = root
         apply_dark_titlebar(root)
         self.root.title("DMX Derby Controller")
-        self.root.configure(bg=COLOR_BG)
+        self.root.configure(bg=parameters.COLOR_BG)
 
         self.dmx: Controller | None = None
         self.is_sending = False
         self.channel_labels: dict[int, ttk.Label] = {}
         self.sliders: dict[int, ttk.Scale] = {}
-        self.presets = PresetManager(PRESETS_DIR)
+        self.presets = PresetManager(parameters.PRESETS_DIR)
 
         self._setup_style()
         self._build_connection_bar()
@@ -152,32 +122,33 @@ class DMXUI:
         style = ttk.Style()
         style.theme_use("clam")
 
-        style.configure(".", background=COLOR_BG, foreground=COLOR_FG, font=("Segoe UI", 9))
-        style.configure("TFrame", background=COLOR_BG)
-        style.configure("TLabelframe", background=COLOR_BG, foreground=COLOR_FG, bordercolor=COLOR_DARK)
-        style.configure("TLabelframe.Label", background=COLOR_BG, foreground=COLOR)
-        style.configure("TLabel", background=COLOR_BG, foreground=COLOR_FG)
+        style.configure(".", background=parameters.COLOR_BG, foreground=parameters.COLOR_FG, font=("Segoe UI", 9))
+        style.configure("TFrame", background=parameters.COLOR_BG)
+        style.configure("TLabelframe", background=parameters.COLOR_BG, foreground=parameters.COLOR_FG, bordercolor=parameters.COLOR_DARK)
+        style.configure("TLabelframe.Label", background=parameters.COLOR_BG, foreground=parameters.COLOR)
+        style.configure("TLabel", background=parameters.COLOR_BG, foreground=parameters.COLOR_FG)
 
-        style.configure("TButton", background=COLOR_BG_LIGHT, foreground=COLOR_FG, bordercolor=COLOR_DARK, focusthickness=1, padding=6)
-        style.map("TButton", background=[("active", COLOR_DARK), ("pressed", COLOR)], foreground=[("active", COLOR_FG)])
+        style.configure("TButton", background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, bordercolor=parameters.COLOR_DARK, focusthickness=1, padding=6)
+        style.map("TButton", background=[("active", parameters.COLOR_DARK), ("pressed", parameters.COLOR)], foreground=[("active", parameters.COLOR_FG)])
 
-        style.configure("TCombobox", fieldbackground=COLOR_BG_LIGHT, background=COLOR_BG_LIGHT, foreground=COLOR_FG, arrowcolor=COLOR)
-        style.map("TCombobox", fieldbackground=[("readonly", COLOR_BG_LIGHT)])
+        style.configure("TCombobox", fieldbackground=parameters.COLOR_BG_LIGHT, background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, arrowcolor=parameters.COLOR)
+        style.map("TCombobox", fieldbackground=[("readonly", parameters.COLOR_BG_LIGHT)])
         # Das aufklappende Popup-Listbox einer Combobox ist ein natives Tk-Listbox-
         # Widget, kein ttk-Widget -- style.configure greift dort nicht, nur option_add
-        self.root.option_add("*TCombobox*Listbox.background", COLOR_BG_LIGHT)
-        self.root.option_add("*TCombobox*Listbox.foreground", COLOR_FG)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", COLOR_DARK)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", COLOR_FG)
-        style.configure("Horizontal.TScale", background=COLOR_BG, troughcolor=COLOR_BG_LIGHT)
-        style.configure("TEntry", fieldbackground=COLOR_BG_LIGHT, foreground=COLOR_FG,insertcolor=COLOR_FG)
+        self.root.option_add("*TCombobox*Listbox.background", parameters.COLOR_BG_LIGHT)
+        self.root.option_add("*TCombobox*Listbox.foreground", parameters.COLOR_FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", parameters.COLOR_DARK)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", parameters.COLOR_FG)
 
-        style.configure("Blackout.TButton", background=COLOR_DARK, foreground=COLOR_FG)
-        style.map("Blackout.TButton", background=[("active", COLOR)])
+        style.configure("Horizontal.TScale", background=parameters.COLOR_BG, troughcolor=parameters.COLOR_BG_LIGHT)
+        style.configure("TEntry", fieldbackground=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, insertcolor=parameters.COLOR_FG)
 
-        style.configure("Cell.TFrame", background=COLOR_BG_LIGHT, bordercolor=COLOR_DARK)
-        style.configure("Status.TLabel", background=COLOR_BG_LIGHT, foreground=COLOR_STATUS_TEXT, font=("Consolas", 9))
-        style.configure("CellTitle.TLabel", background=COLOR_BG_LIGHT, foreground=COLOR_FG, font=("Segoe UI", 9, "bold"))
+        style.configure("Blackout.TButton", background=parameters.COLOR_DARK, foreground=parameters.COLOR_FG)
+        style.map("Blackout.TButton", background=[("active", parameters.COLOR)])
+
+        style.configure("Cell.TFrame", background=parameters.COLOR_BG_LIGHT, bordercolor=parameters.COLOR_DARK)
+        style.configure("Status.TLabel", background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_STATUS_TEXT, font=("Consolas", 9))
+        style.configure("CellTitle.TLabel", background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, font=("Segoe UI", 9, "bold"))
 
     # --------- UI
     def _build_connection_bar(self) -> None:
@@ -201,22 +172,22 @@ class DMXUI:
         grid = ttk.LabelFrame(self.root, text="DMX Channels", padding=10)
         grid.pack(fill="both", expand=True, padx=10, pady=5)
 
-        for i in range(CHANNEL_COUNT):
+        for i in range(parameters.CHANNEL_COUNT):
             channel = i + 1
             row, col = divmod(i, 3)
             grid.columnconfigure(col, weight=1)
-            self._build_cell(grid, row, col, channel, self.CHANNEL_NAMES[i])
+            self._build_cell(grid, row, col, channel, parameters.CHANNEL_NAMES[i])
 
     def _build_cell(self, parent: ttk.Frame, row: int, col: int, channel: int, name: str) -> None:
         cell = ttk.Frame(parent, padding=5, relief="groove", style="Cell.TFrame")
         cell.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
         cell.pack_propagate(False)
-        cell.configure(width=CELL_WIDTH, height=CELL_HEIGHT)
+        cell.configure(width=parameters.CELL_WIDTH, height=parameters.CELL_HEIGHT)
 
         ttk.Label(cell, text=name, style="CellTitle.TLabel").pack(anchor="w")
 
         status = ttk.Label(cell, text="---", style="Status.TLabel",
-                            width=STATUS_LABEL_CHARS, anchor="w")
+                            width=parameters.STATUS_LABEL_CHARS, anchor="w")
         status.pack(anchor="w", pady=(2, 5), fill="x")
         self.channel_labels[channel] = status
 
@@ -243,14 +214,14 @@ class DMXUI:
         ttk.Button(bar, text="Delete", command=self.delete_preset).pack(side="left", padx=5)
 
     def _open_music_mode(self) -> None:
-        channel_names = {ch: self.CHANNEL_NAMES[ch - 1] for ch in range(1, CHANNEL_COUNT + 1)}
+        channel_names = {ch: parameters.CHANNEL_NAMES[ch - 1] for ch in range(1, parameters.CHANNEL_COUNT + 1)}
         window = MusicModeWindow(
             self.root,
             channel_names=channel_names,
             set_channel_value=self._music_set_channel,
             restore_sliders=self._music_restore_sliders,
             on_closed=self._on_music_mode_closed,
-            colors=_active,
+            colors=parameters.ACTIVE_SCHEME,
         )
         window.update_idletasks()
         self.root.withdraw()
@@ -334,7 +305,7 @@ class DMXUI:
             except (serial.SerialException, OSError) as e:
                 self.root.after(0, self._connection_lost, e)
                 return
-            time.sleep(SEND_INTERVAL_S)
+            time.sleep(parameters.SEND_INTERVAL_S)
 
 
     # --------- actions
@@ -404,7 +375,7 @@ class ThemedDialog(tk.Toplevel):
     def __init__(self, parent: tk.Tk, title: str, message: str, buttons: list[str], with_entry: bool = False):
         super().__init__(parent)
         self.title(title)
-        self.configure(bg=COLOR_BG)
+        self.configure(bg=parameters.COLOR_BG)
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -460,14 +431,3 @@ def ask_string(parent: tk.Tk, title: str, message: str) -> str | None:
     if dlg.result == "OK" and dlg.entry_value:
         return dlg.entry_value
     return None
-
-
-def main() -> None:
-    enable_dpi_awareness()
-    root = tk.Tk()
-    root.protocol("WM_DELETE_WINDOW", DMXUI(root).on_close)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()

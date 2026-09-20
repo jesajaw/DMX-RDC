@@ -22,24 +22,36 @@ Hinweis Plattform:
   einen Fehler (ueber on_frame(AudioFrame(error=...))), der Rest der UI
   bleibt aber benutzbar. Kein Titel/Interpret.
 
-Die Titel/Interpret-Anzeige liest den Fenstertitel bekannter Media-Player-
-Prozesse aus (siehe KNOWN_PLAYER_PROCESSES) -- bewusst KEIN winsdk/winrt, da
-dieses Projekt archiviert ist. Vorteil: aktiv gepflegtes pywin32, keine
-Build-Toolchain noetig. Nachteil: kein Cover-Art moeglich, und das Format
-("Interpret - Titel") ist Player-abhaengig und nicht garantiert.
+Die Titel/Interpret/Cover-Anzeige nutzt primaer NowPlayingBridge.exe, einen
+kleinen C#/.NET-Hintergrundprozess (siehe src/Program.cs),
+der first-party WinRT anspricht -- dieselbe SMTC-Quelle wie die Windows-
+Lautstaerke-Vorschau. Grund: winsdk/winrt (die Python-WinRT-Bindungen) sind
+archiviert und haben fuer neuere Python-Versionen keine fertigen Wheels mehr.
+.NET hat WinRT-Unterstuetzung dagegen first-party und aktiv gepflegt. Python
+selbst spricht dabei kein COM/WinRT -- es startet die .exe als Subprozess und
+liest deren JSON-/Cover-Ausgabedateien per stinknormalem Datei-I/O.
+Ist NowPlayingBridge.exe noch nicht gebaut (siehe Docstring dort), faellt
+NowPlayingReader automatisch auf eine reine Fenstertitel-Heuristik zurueck
+(parameters.KNOWN_PLAYER_PROCESSES, z.B. "Interpret - Titel" bei Spotify) --
+dann gibt's Titel/Interpret, aber kein Cover. Ohne Cover zeigt die Scheibe
+eine kleine rotierende Pixel-Art-Animation statt eines leeren Kreises.
 
 Threading-Modell:
 - Die Audioaufnahme laeuft NICHT in einem eigenen Python-Thread: PyAudioWPatch
   (PortAudio) ruft AudioAnalyzer._audio_callback direkt aus seinem eigenen
   nativen Audio-Thread auf, sobald ein Block bereitsteht.
-- Now-Playing-Abfrage laeuft in einem eigenen Daemon-Thread (NowPlayingReader._loop)
+- Now-Playing-Abfrage laeuft in einem eigenen Daemon-Thread (NowPlayingReader._loop),
+  der entweder NowPlayingBridge.exe pollt oder (Fallback) Fenstertitel scannt.
 - Ergebnisse gehen NICHT direkt in Tkinter, sondern ueber Callbacks nach
   draussen; MusicModeWindow marshallt sie per self.after(0, ...) in den
   GUI-Thread zurueck
 """
 
+import io
+import json
 import logging
 import math
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -50,7 +62,14 @@ from tkinter import ttk
 import numpy as np
 import pyaudiowpatch as pyaudio
 
+from .config import parameters
 from .controller import apply_dark_titlebar
+
+try:
+    from PIL import Image, ImageDraw, ImageTk
+    _PIL_AVAILABLE = True
+except Exception:
+    _PIL_AVAILABLE = False
 
 try:
     import win32gui
@@ -60,51 +79,6 @@ try:
     _MEDIA_AVAILABLE = True
 except Exception:
     _MEDIA_AVAILABLE = False
-
-
-SAMPLE_RATE = 48000                  # Platzhalter, wird beim Start durchs echte Geraet ersetzt
-BLOCK_SIZE = 1024
-N_BARS = 24
-WAVE_POINTS = 160
-BAR_FREQ_RANGE = (20, 16000)         # log-verteilte Grenzen fuers Spektrum
-ENERGY_HISTORY_LEN = 43              # ~1s bei ~21ms/Block, fuer Beat-Erkennung
-BEAT_THRESHOLD_RATIO = 1.3           # Energie muss X-fach ueber dem Mittel liegen
-BEAT_MIN_ENERGY = 0.02               # Mindestenergie, damit Stille keinen Beat ausloest
-BEAT_DECAY = 0.75                    # Abklingfaktor des Beat-Pulses pro Block
-PITCH_REFERENCE_HZ = 4000.0          # Normalisierungsreferenz fuer den Spektralschwerpunkt
-
-BAND_RANGES = {
-    "bass": (20, 250),
-    "mid": (250, 4000),
-    "treble": (4000, 16000),
-}
-
-# Music-Mode-Quellen, die auf DMX-Kanäle gemappt werden können
-SOURCES = ("bass", "mid", "treble", "beat", "pitch")
-SOURCE_LABELS = {
-    "bass": "Bass", "mid": "Mid", "treble": "Treble", "beat": "Beat", "pitch": "Pitch",
-}
-
-# Spectrum/Waveform bewusst gleich gross, damit sie symmetrisch nebeneinander sitzen
-BAR_CANVAS_WIDTH = 280
-BAR_CANVAS_HEIGHT = 150
-WAVE_CANVAS_WIDTH = 280
-WAVE_CANVAS_HEIGHT = 150
-DISC_SIZE = 150
-
-# Pixel-Art-"Label" auf der Scheibe (Ersatz fuer echtes Cover-Art, siehe Docstring)
-PIXEL_DOT_COUNT = 8
-PIXEL_DOT_RADIUS = 22
-PIXEL_DOT_SIZE = 6
-SPIN_STEP_DEG = 6
-SPIN_INTERVAL_MS = 80
-
-# Bekannte Media-Player-Prozesse, deren Fenstertitel nach "Interpret - Titel"
-# durchsucht wird. Bei Bedarf einfach ergaenzen.
-KNOWN_PLAYER_PROCESSES = {
-    "spotify.exe", "vlc.exe", "foobar2000.exe", "wmplayer.exe",
-    "musicbee.exe", "itunes.exe", "winamp.exe", "aimp.exe",
-}
 
 
 @dataclass
@@ -139,14 +113,14 @@ class AudioAnalyzer:
     abstuerzte.)
     """
 
-    def __init__(self, on_frame, blocksize: int = BLOCK_SIZE,
-                 gain: float = 1.5, smoothing: float = 0.7, n_bars: int = N_BARS):
+    def __init__(self, on_frame, blocksize: int = parameters.BLOCK_SIZE,
+                 gain: float = 1.5, smoothing: float = 0.7, n_bars: int = parameters.N_BARS):
         self.on_frame = on_frame            # callback(frame: AudioFrame)
         self.blocksize = blocksize
         self.gain = gain                    # Empfindlichkeit, live aenderbar
         self.smoothing = smoothing          # 0..~0.95, hoeher = traeger/ruhiger
         self.n_bars = n_bars
-        self.samplerate = SAMPLE_RATE       # Platzhalter, wird in start() durchs echte Geraet ersetzt
+        self.samplerate = parameters.SAMPLE_RATE  # Platzhalter, wird in start() durchs echte Geraet ersetzt
         self._channels = 2                  # Platzhalter, wird in start() durchs echte Geraet ersetzt
 
         self._running = False
@@ -154,9 +128,9 @@ class AudioAnalyzer:
         self._stream = None
         self._levels = {"bass": 0.0, "mid": 0.0, "treble": 0.0}
         self._bar_levels = np.zeros(n_bars)
-        self._bar_edges = np.geomspace(BAR_FREQ_RANGE[0], BAR_FREQ_RANGE[1], n_bars + 1)
+        self._bar_edges = np.geomspace(parameters.BAR_FREQ_RANGE[0], parameters.BAR_FREQ_RANGE[1], n_bars + 1)
         self._window = np.hanning(blocksize)
-        self._energy_history = deque(maxlen=ENERGY_HISTORY_LEN)
+        self._energy_history = deque(maxlen=parameters.ENERGY_HISTORY_LEN)
         self._beat_level = 0.0
         self._pitch_level = 0.0
 
@@ -234,7 +208,7 @@ class AudioAnalyzer:
         spectrum = np.abs(np.fft.rfft(windowed)) / len(windowed)
         freqs = np.fft.rfftfreq(len(windowed), d=1.0 / self.samplerate)
 
-        for name, (lo, hi) in BAND_RANGES.items():
+        for name, (lo, hi) in parameters.BAND_RANGES.items():
             mask = (freqs >= lo) & (freqs < hi)
             energy = float(np.sqrt(np.mean(spectrum[mask] ** 2))) if mask.any() else 0.0
             level = min(1.0, energy * self.gain)
@@ -251,17 +225,17 @@ class AudioAnalyzer:
         total_energy = float(np.sqrt(np.mean(spectrum ** 2)))
         avg_energy = float(np.mean(self._energy_history)) if self._energy_history else 0.0
         self._energy_history.append(total_energy)
-        is_onset = (avg_energy > 0 and total_energy > avg_energy * BEAT_THRESHOLD_RATIO
-                    and total_energy > BEAT_MIN_ENERGY)
-        self._beat_level = max(1.0 if is_onset else 0.0, self._beat_level * BEAT_DECAY)
+        is_onset = (avg_energy > 0 and total_energy > avg_energy * parameters.BEAT_THRESHOLD_RATIO
+                    and total_energy > parameters.BEAT_MIN_ENERGY)
+        self._beat_level = max(1.0 if is_onset else 0.0, self._beat_level * parameters.BEAT_DECAY)
 
         # Pitch: normalisierter Spektralschwerpunkt (0=bassig, 1=hell)
         magnitude_sum = float(np.sum(spectrum))
         centroid = float(np.sum(freqs * spectrum) / magnitude_sum) if magnitude_sum > 0 else 0.0
-        pitch_norm = min(1.0, centroid / PITCH_REFERENCE_HZ)
+        pitch_norm = min(1.0, centroid / parameters.PITCH_REFERENCE_HZ)
         self._pitch_level = self.smoothing * self._pitch_level + (1 - self.smoothing) * pitch_norm
 
-        step = max(1, len(samples) // WAVE_POINTS)
+        step = max(1, len(samples) // parameters.WAVE_POINTS)
         waveform = np.clip(samples[::step], -1.0, 1.0)
 
         self.on_frame(AudioFrame(
@@ -286,7 +260,7 @@ def _get_process_name(pid: int) -> str:
 
 def _find_now_playing_title() -> str | None:
     """Sucht unter den sichtbaren Top-Level-Fenstern eines bekannten Media-Players
-    (KNOWN_PLAYER_PROCESSES) und gibt dessen Fenstertitel zurueck, oder None."""
+    (parameters.KNOWN_PLAYER_PROCESSES) und gibt dessen Fenstertitel zurueck, oder None."""
     found = []
 
     def _callback(hwnd, _):
@@ -299,7 +273,7 @@ def _find_now_playing_title() -> str | None:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
         except Exception:
             return
-        if _get_process_name(pid) in KNOWN_PLAYER_PROCESSES:
+        if _get_process_name(pid) in parameters.KNOWN_PLAYER_PROCESSES:
             found.append(title)
 
     try:
@@ -318,37 +292,97 @@ def _parse_title(raw: str) -> tuple[str, str]:
 
 
 class NowPlayingReader:
-    """Liest Titel/Interpret aus dem Fenstertitel bekannter Media-Player-Prozesse
-    (siehe KNOWN_PLAYER_PROCESSES), z.B. "Interpret - Titel" bei Spotify.
-    Windows-only, kein Cover-Art moeglich mit diesem Ansatz, und das Format ist
-    Player-abhaengig -- daf uer aber komplett ohne winsdk/winrt (siehe Docstring
-    oben). Ohne pywin32 bleibt sie inaktiv, on_update wird dann nie aufgerufen."""
+    """Liefert Titel/Interpret/Cover des aktuell spielenden Tracks.
 
-    def __init__(self, on_update, poll_interval: float = 2.0):
-        self.on_update = on_update  # callback(title: str, artist: str)
+    Primaer: startet NowPlayingBridge.exe (C#/.NET, first-party WinRT) als
+    Hintergrundprozess und pollt deren JSON-/Cover-Ausgabedateien -- liefert
+    Titel, Interpret UND Cover-Art (dieselbe Quelle wie die Windows-Vorschau).
+
+    Fallback (falls parameters.NOWPLAYING_BRIDGE_EXE nicht existiert, also noch
+    nicht gebaut wurde): reine Fenstertitel-Heuristik ueber bekannte Media-
+    Player-Prozesse (parameters.KNOWN_PLAYER_PROCESSES), z.B. "Interpret -
+    Titel" bei Spotify -- liefert nur Titel/Interpret, kein Cover. Ohne pywin32
+    bleibt auch dieser Fallback inaktiv, on_update wird dann nie aufgerufen.
+    """
+
+    def __init__(self, on_update, poll_interval: float = 1.0):
+        self.on_update = on_update  # callback(title: str, artist: str, cover_bytes: bytes | None)
         self.poll_interval = poll_interval
         self._running = False
         self._thread = None
-        self._last_raw = None
+        self._process = None
+        self._last_signature = None
+        self._use_bridge = parameters.NOWPLAYING_BRIDGE_EXE.exists()
 
     def start(self) -> None:
-        if not _MEDIA_AVAILABLE or self._running:
+        if self._running:
+            return
+        if not self._use_bridge and not _MEDIA_AVAILABLE:
             return
         self._running = True
+        if self._use_bridge:
+            self._start_bridge_process()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._running = False
+        if self._process is not None:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+            self._process = None
+
+    def _start_bridge_process(self) -> None:
+        cache_dir = parameters.NOWPLAYING_CACHE_DIR
+        cache_dir.mkdir(exist_ok=True)
+        try:
+            self._process = subprocess.Popen(
+                [str(parameters.NOWPLAYING_BRIDGE_EXE), str(cache_dir), str(int(self.poll_interval * 1000))],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            logging.exception("NowPlayingBridge.exe konnte nicht gestartet werden")
+            self._process = None
+            self._use_bridge = False
 
     def _loop(self) -> None:
         while self._running:
-            raw = _find_now_playing_title()
-            if raw and raw != self._last_raw:
-                self._last_raw = raw
-                artist, title = _parse_title(raw)
-                self.on_update(title, artist)
+            if self._use_bridge:
+                self._poll_bridge_files()
+            else:
+                raw = _find_now_playing_title()
+                if raw and raw != self._last_signature:
+                    self._last_signature = raw
+                    artist, title = _parse_title(raw)
+                    self.on_update(title, artist, None)
             time.sleep(self.poll_interval)
+
+    def _poll_bridge_files(self) -> None:
+        cache_dir = parameters.NOWPLAYING_CACHE_DIR
+        try:
+            data = json.loads((cache_dir / "nowplaying.json").read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        title = data.get("title", "")
+        artist = data.get("artist", "")
+        has_cover = bool(data.get("hasCover", False))
+        signature = (title, artist, has_cover)
+        if signature == self._last_signature:
+            return
+        self._last_signature = signature
+
+        cover_bytes = None
+        if has_cover:
+            try:
+                cover_bytes = (cache_dir / "nowplaying_cover.img").read_bytes()
+            except Exception:
+                cover_bytes = None
+
+        self.on_update(title, artist, cover_bytes)
 
 
 class MusicModeWindow(tk.Toplevel):
@@ -364,7 +398,7 @@ class MusicModeWindow(tk.Toplevel):
         on_closed:         callback() -> None, wird beim Schliessen dieses Fensters
                             aufgerufen (Hauptfenster soll sich dann wieder zeigen)
         colors:             dict mit BG/BG_LIGHT/FG/ACCENT/ACCENT_DARK/STATUS_TEXT
-                            (gleiche Form wie die Scheme-Dicts im Hauptfenster)
+                            (gleiche Form wie parameters.ACTIVE_SCHEME)
         """
         super().__init__(parent)
         self.title("Music Mode")
@@ -413,34 +447,41 @@ class MusicModeWindow(tk.Toplevel):
 
     def _build_disc(self, parent: ttk.Frame) -> None:
         colors = self.colors
-        self.disc_canvas = tk.Canvas(parent, width=DISC_SIZE, height=DISC_SIZE,
+        size = parameters.DISC_SIZE
+        self.disc_canvas = tk.Canvas(parent, width=size, height=size,
                                       bg=colors["BG"], highlightthickness=0)
         self.disc_canvas.pack()
 
-        cx = cy = DISC_SIZE / 2
-        self.disc_canvas.create_oval(4, 4, DISC_SIZE - 4, DISC_SIZE - 4,
+        cx = cy = size / 2
+        self.disc_canvas.create_oval(4, 4, size - 4, size - 4,
                                       outline=colors["ACCENT_DARK"], width=2)
-        for r in range(int(DISC_SIZE / 2) - 8, 24, -12):
+        for r in range(int(size / 2) - 8, 24, -12):
             self.disc_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
                                           outline=colors["ACCENT_DARK"], width=1)
 
-        # Kleine rotierende Pixel-Art-Punkte als "Label" der Schallplatte -- echtes
-        # Cover-Art ist ohne winsdk/winrt nicht verfuegbar (siehe Modul-Docstring)
+        # Kleine rotierende Pixel-Art-Punkte als Fallback-"Label", solange kein
+        # echtes Cover vorliegt (siehe Modul-Docstring)
         self._pixel_ids = []
-        for i in range(PIXEL_DOT_COUNT):
+        for i in range(parameters.PIXEL_DOT_COUNT):
             color = colors["ACCENT"] if i % 2 == 0 else colors["ACCENT_DARK"]
             dot_id = self.disc_canvas.create_rectangle(0, 0, 0, 0, fill=color, outline="")
             self._pixel_ids.append(dot_id)
         self.disc_canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
                                       fill=colors["FG"], outline="")
+
+        # Cover-Image liegt zuletzt im Zeichen-Stapel -> ueberdeckt die Pixel-
+        # Punkte automatisch, sobald ein Cover gesetzt wird (image=None zeichnet nichts)
+        self._cover_image_item = self.disc_canvas.create_image(cx, cy, image=None)
+        self._cover_photo = None   # Referenz halten, sonst raeumt Tkinter das Bild weg
+        self._base_cover = None    # zirkulaer maskiertes, ungedrehtes PIL-Image
         self._disc_angle = 0.0
 
         self.track_label = ttk.Label(parent, text="", font=("Segoe UI", 9, "bold"),
-                                      wraplength=DISC_SIZE + 20, justify="center")
+                                      wraplength=size + 20, justify="center")
         self.track_label.pack(pady=(5, 0))
 
-        if not _MEDIA_AVAILABLE:
-            self.track_label.config(text="(pywin32 fehlt -> kein Titel)")
+        if not _MEDIA_AVAILABLE and not parameters.NOWPLAYING_BRIDGE_EXE.exists():
+            self.track_label.config(text="(NowPlayingBridge.exe fehlt, pywin32 fehlt -> kein Titel)")
         else:
             self.now_playing = NowPlayingReader(on_update=self._on_now_playing)
             self.now_playing.start()
@@ -450,53 +491,61 @@ class MusicModeWindow(tk.Toplevel):
     def _spin_disc(self) -> None:
         if not self.winfo_exists():
             return
-        self._disc_angle = (self._disc_angle + SPIN_STEP_DEG) % 360
-        cx = cy = DISC_SIZE / 2
+        self._disc_angle = (self._disc_angle + parameters.SPIN_STEP_DEG) % 360
+        cx = cy = parameters.DISC_SIZE / 2
         count = len(self._pixel_ids)
         for i, dot_id in enumerate(self._pixel_ids):
             angle = math.radians(self._disc_angle + i * (360 / count))
-            x = cx + PIXEL_DOT_RADIUS * math.cos(angle)
-            y = cy + PIXEL_DOT_RADIUS * math.sin(angle)
-            half = PIXEL_DOT_SIZE / 2
+            x = cx + parameters.PIXEL_DOT_RADIUS * math.cos(angle)
+            y = cy + parameters.PIXEL_DOT_RADIUS * math.sin(angle)
+            half = parameters.PIXEL_DOT_SIZE / 2
             self.disc_canvas.coords(dot_id, x - half, y - half, x + half, y + half)
-        self.after(SPIN_INTERVAL_MS, self._spin_disc)
+
+        if _PIL_AVAILABLE and self._base_cover is not None:
+            rotated = self._base_cover.rotate(self._disc_angle, resample=Image.BICUBIC)
+            self._cover_photo = ImageTk.PhotoImage(rotated)
+            self.disc_canvas.itemconfig(self._cover_image_item, image=self._cover_photo)
+
+        self.after(parameters.SPIN_INTERVAL_MS, self._spin_disc)
 
     def _build_plots(self, parent: ttk.Frame) -> None:
         colors = self.colors
+        bar_w, bar_h = parameters.BAR_CANVAS_WIDTH, parameters.BAR_CANVAS_HEIGHT
+        wave_w, wave_h = parameters.WAVE_CANVAS_WIDTH, parameters.WAVE_CANVAS_HEIGHT
 
         spectrum_col = ttk.Frame(parent)
         spectrum_col.pack(side="left", padx=(0, 15))
         ttk.Label(spectrum_col, text="Spectrum", style="CellTitle.TLabel").pack(anchor="w")
-        self.bar_canvas = tk.Canvas(spectrum_col, width=BAR_CANVAS_WIDTH, height=BAR_CANVAS_HEIGHT,
+        self.bar_canvas = tk.Canvas(spectrum_col, width=bar_w, height=bar_h,
                                      bg=colors["BG_LIGHT"], highlightthickness=0)
         self.bar_canvas.pack()
-        bar_width = BAR_CANVAS_WIDTH / N_BARS
-        for i in range(N_BARS):
+        bar_width = bar_w / parameters.N_BARS
+        for i in range(parameters.N_BARS):
             x0 = i * bar_width + 2
             x1 = x0 + bar_width - 4
             bar_id = self.bar_canvas.create_rectangle(
-                x0, BAR_CANVAS_HEIGHT, x1, BAR_CANVAS_HEIGHT, fill=colors["ACCENT"], width=0)
+                x0, bar_h, x1, bar_h, fill=colors["ACCENT"], width=0)
             self._bar_ids.append(bar_id)
 
         wave_col = ttk.Frame(parent)
         wave_col.pack(side="left")
         ttk.Label(wave_col, text="Waveform", style="CellTitle.TLabel").pack(anchor="w")
-        self.wave_canvas = tk.Canvas(wave_col, width=WAVE_CANVAS_WIDTH, height=WAVE_CANVAS_HEIGHT,
+        self.wave_canvas = tk.Canvas(wave_col, width=wave_w, height=wave_h,
                                       bg=colors["BG_LIGHT"], highlightthickness=0)
         self.wave_canvas.pack()
-        mid_y = WAVE_CANVAS_HEIGHT / 2
+        mid_y = wave_h / 2
         self._wave_line = self.wave_canvas.create_line(
-            0, mid_y, WAVE_CANVAS_WIDTH, mid_y, fill=colors["ACCENT"], width=1.5, smooth=True)
+            0, mid_y, wave_w, mid_y, fill=colors["ACCENT"], width=1.5, smooth=True)
 
     def _build_mapping(self) -> None:
         mapping = ttk.LabelFrame(self, text="Channel Mapping", padding=10)
         mapping.pack(fill="x", padx=10, pady=5)
 
         options = ["None"] + [self.channel_names[c] for c in sorted(self.channel_names)]
-        for source in SOURCES:
+        for source in parameters.SOURCES:
             row = ttk.Frame(mapping)
             row.pack(fill="x", pady=2)
-            ttk.Label(row, text=SOURCE_LABELS[source], width=8).pack(side="left")
+            ttk.Label(row, text=parameters.SOURCE_LABELS[source], width=8).pack(side="left")
 
             var = tk.StringVar(value="None")
             self.mapping_vars[source] = var
@@ -573,33 +622,50 @@ class MusicModeWindow(tk.Toplevel):
     def _update_bars(self, bars) -> None:
         if bars is None:
             return
-        bar_width = BAR_CANVAS_WIDTH / N_BARS
+        bar_w, bar_h = parameters.BAR_CANVAS_WIDTH, parameters.BAR_CANVAS_HEIGHT
+        bar_width = bar_w / parameters.N_BARS
         for i, level in enumerate(bars):
             x0 = i * bar_width + 2
             x1 = x0 + bar_width - 4
-            y1 = BAR_CANVAS_HEIGHT
-            y0 = BAR_CANVAS_HEIGHT - level * BAR_CANVAS_HEIGHT
+            y1 = bar_h
+            y0 = bar_h - level * bar_h
             self.bar_canvas.coords(self._bar_ids[i], x0, y0, x1, y1)
 
     def _update_waveform(self, waveform) -> None:
         if waveform is None or len(waveform) < 2:
             return
+        wave_w, wave_h = parameters.WAVE_CANVAS_WIDTH, parameters.WAVE_CANVAS_HEIGHT
         n = len(waveform)
-        mid_y = WAVE_CANVAS_HEIGHT / 2
+        mid_y = wave_h / 2
         points = []
         for i, sample in enumerate(waveform):
-            x = i / (n - 1) * WAVE_CANVAS_WIDTH
+            x = i / (n - 1) * wave_w
             y = mid_y - sample * mid_y * 0.9
             points.extend((x, y))
         self.wave_canvas.coords(self._wave_line, *points)
 
     # --------- Now Playing
-    def _on_now_playing(self, title: str, artist: str) -> None:
-        self.after(0, self._apply_now_playing, title, artist)
+    def _on_now_playing(self, title: str, artist: str, cover_bytes) -> None:
+        self.after(0, self._apply_now_playing, title, artist, cover_bytes)
 
-    def _apply_now_playing(self, title: str, artist: str) -> None:
+    def _apply_now_playing(self, title: str, artist: str, cover_bytes) -> None:
         text = f"{title}\n{artist}" if artist else (title or "")
         self.track_label.config(text=text)
+
+        if not (_PIL_AVAILABLE and cover_bytes):
+            self._base_cover = None
+            return
+        try:
+            cover_size = parameters.COVER_SIZE
+            img = Image.open(io.BytesIO(cover_bytes)).convert("RGBA")
+            img = img.resize((cover_size, cover_size), Image.LANCZOS)
+            mask = Image.new("L", (cover_size, cover_size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, cover_size, cover_size), fill=255)
+            img.putalpha(mask)
+            self._base_cover = img
+        except Exception:
+            logging.exception("Cover konnte nicht verarbeitet werden")
+            self._base_cover = None
 
     # --------- Schliessen
     def _on_close(self) -> None:

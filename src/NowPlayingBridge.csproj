@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Die "-windows10.0.xxxxx.0"-TargetFramework aktiviert first-party
+         WinRT-Interop fuer Windows-SDK-Contract-APIs wie Windows.Media.Control,
+         ganz ohne zusaetzliche NuGet-Pakete oder Projektvorlagen. -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>NowPlayingBridge</RootNamespace>
+    <AssemblyName>NowPlayingBridge</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+</Project>
