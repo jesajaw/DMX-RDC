@@ -1,5 +1,19 @@
+# Cross-platform
 pyserial>=3.5
-PyAudioWPatch>=0.2.12
 numpy>=1.26
-pillow>=10.0  # für Cover-Art-Rendering (Kreis-Maske, Rotation) in Music Mode
-pywin32>=306  # optional, nur Fallback für Titel/Interpret ohne NowPlayingBridge.exe (Windows-only)
+pillow>=10.0
+
+# Windows only: WASAPI loopback audio capture
+PyAudioWPatch>=0.2.12; sys_platform == "win32"
+
+# Windows only, optional: window-title fallback for title/artist, used only
+# if src/out/NowPlayingBridge.exe hasn't been built (see README)
+pywin32>=306; sys_platform == "win32"
+
+# Linux only: PulseAudio/PipeWire loopback audio capture via plain PyAudio
+# (not the Windows-specific PyAudioWPatch fork). Needs PortAudio dev headers
+# on some distros, e.g. `sudo apt install portaudio19-dev` on Debian/Ubuntu.
+PyAudio>=0.2.14; sys_platform != "win32"
+
+# Linux only, optional: MPRIS (title/artist/cover) over D-Bus
+jeepney>=0.8.0; sys_platform != "win32"

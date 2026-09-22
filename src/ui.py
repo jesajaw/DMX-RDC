@@ -5,15 +5,15 @@ DMX Derby Controller
 Tkinter GUI to control a Razor Derby over a USB-DMX adapter
 (RS485, 250000 baud, 2 stop bits).
 
-Aufgeteilt in vier Dateien:
-- config.py:     zentrale parameters-Klasse, einzige Quelle aller Konstanten
-- controller.py: DMX-Serial-Controller, Preset-Persistenz, Windows-Plattform-Helfer
-- musicmode.py:  Audioanalyse + Music-Mode-Fenster
-- ui.py (diese Datei): Theme/Farbschema, Hauptfenster (DMXUI), Dialoge
+Split across four files:
+- config.py:     central parameters class, single source of all constants
+- controller.py: DMX serial controller, preset persistence, platform helpers
+- musicmode.py:  audio analysis + Music Mode window
+- ui.py (this file): theme/color scheme, main window (DMXUI), dialogs
 
-Der Einstiegspunkt liegt NICHT hier, sondern in main.py im Projekt-Root --
-diese Datei stellt nur DMXUI (und die Dialog-Helfer) bereit, ohne selbst
-Tk-Root/Mainloop zu starten.
+The entry point does NOT live here but in main.py at the project root --
+this file only provides DMXUI (and the dialog helpers), without starting a
+Tk root/mainloop itself.
 
 Threading model
 ----------------
@@ -133,8 +133,8 @@ class DMXUI:
 
         style.configure("TCombobox", fieldbackground=parameters.COLOR_BG_LIGHT, background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, arrowcolor=parameters.COLOR)
         style.map("TCombobox", fieldbackground=[("readonly", parameters.COLOR_BG_LIGHT)])
-        # Das aufklappende Popup-Listbox einer Combobox ist ein natives Tk-Listbox-
-        # Widget, kein ttk-Widget -- style.configure greift dort nicht, nur option_add
+        # A combobox's popup listbox is a native Tk Listbox widget, not a ttk
+        # widget -- style.configure doesn't reach it, only option_add does
         self.root.option_add("*TCombobox*Listbox.background", parameters.COLOR_BG_LIGHT)
         self.root.option_add("*TCombobox*Listbox.foreground", parameters.COLOR_FG)
         self.root.option_add("*TCombobox*Listbox.selectBackground", parameters.COLOR_DARK)
@@ -235,7 +235,7 @@ class DMXUI:
             return
         if str(slider.cget("state")) != "disabled":
             slider.state(["disabled"])
-        slider.set(value)  # feuert on_slider_change -> Anzeige + dmx.set_channel
+        slider.set(value)  # triggers on_slider_change -> display + dmx.set_channel
 
     def _music_restore_sliders(self, channels: list[int]) -> None:
         for channel in channels:
@@ -298,7 +298,7 @@ class DMXUI:
         show_error(self.root, "Connection Lost", f"DMX connection interrupted:\n{error}")
 
     def _send_loop(self) -> None:
-        # Background send cycle -- exits and reporst on write failure (unplug) instead of failing silently
+        # Background send cycle -- exits and reports on write failure (unplug) instead of failing silently
         while self.is_sending:
             try:
                 self.dmx.send()

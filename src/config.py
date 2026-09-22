@@ -1,10 +1,10 @@
 """
-Zentrale Konfiguration
+Central Configuration
 =======================
 
-Alle Konstanten des Projekts an einem Ort. controller.py, musicmode.py und
-ui.py importieren ausschliesslich von hier (from .config import parameters)
-statt eigene Kopien zu pflegen -- eine einzige Quelle der Wahrheit.
+All project constants live in one place. controller.py, musicmode.py and
+ui.py only ever import from here (from .config import parameters) instead of
+keeping their own copies -- a single source of truth.
 """
 
 from pathlib import Path
@@ -13,19 +13,19 @@ from pathlib import Path
 class parameters:
     # --- DMX / Controller ---
     UNIVERSE_SIZE = 513  # channel 0 unused, DMX starts at 1
-    SEND_INTERVAL_S = 0.03  # ca. 33 Hz
+    SEND_INTERVAL_S = 0.03  # ~33 Hz
 
-    # --- Music Mode / Audioanalyse ---
-    SAMPLE_RATE = 48000                  # Platzhalter, wird beim Start durchs echte Geraet ersetzt
+    # --- Music Mode / audio analysis ---
+    SAMPLE_RATE = 48000                  # placeholder, replaced by the real device at start()
     BLOCK_SIZE = 1024
     N_BARS = 24
     WAVE_POINTS = 160
-    BAR_FREQ_RANGE = (20, 16000)         # log-verteilte Grenzen fuers Spektrum
-    ENERGY_HISTORY_LEN = 43              # ~1s bei ~21ms/Block, fuer Beat-Erkennung
-    BEAT_THRESHOLD_RATIO = 1.3           # Energie muss X-fach ueber dem Mittel liegen
-    BEAT_MIN_ENERGY = 0.02               # Mindestenergie, damit Stille keinen Beat ausloest
-    BEAT_DECAY = 0.75                    # Abklingfaktor des Beat-Pulses pro Block
-    PITCH_REFERENCE_HZ = 4000.0          # Normalisierungsreferenz fuer den Spektralschwerpunkt
+    BAR_FREQ_RANGE = (20, 16000)         # log-spaced bounds for the spectrum
+    ENERGY_HISTORY_LEN = 43              # ~1s at ~21ms/block, used for beat detection
+    BEAT_THRESHOLD_RATIO = 1.3           # energy must be this many times above the rolling average
+    BEAT_MIN_ENERGY = 0.02               # minimum energy so silence never triggers a beat
+    BEAT_DECAY = 0.75                    # decay factor of the beat pulse per block
+    PITCH_REFERENCE_HZ = 4000.0          # normalization reference for the spectral centroid
 
     BAND_RANGES = {
         "bass": (20, 250),
@@ -38,31 +38,33 @@ class parameters:
         "bass": "Bass", "mid": "Mid", "treble": "Treble", "beat": "Beat", "pitch": "Pitch",
     }
 
-    # Spectrum/Waveform bewusst gleich gross, damit sie symmetrisch nebeneinander sitzen
+    # Spectrum/waveform are deliberately the same size so they sit symmetrically side by side
     BAR_CANVAS_WIDTH = 280
     BAR_CANVAS_HEIGHT = 150
     WAVE_CANVAS_WIDTH = 280
     WAVE_CANVAS_HEIGHT = 150
     DISC_SIZE = 150
-    COVER_SIZE = 104  # Durchmesser des Covers auf der Scheibe (Kreis-Maske)
+    COVER_SIZE = 104  # diameter of the cover art on the disc (circular mask)
 
-    # Pixel-Art-"Label" auf der Scheibe -- Fallback, solange kein Cover vorliegt
-    # (kein Titel gefunden, oder NowPlayingBridge.exe noch nicht gebaut)
+    # Pixel-art "label" on the disc -- fallback shown while no cover art is available
+    # (no track found, or the platform-specific now-playing source has no cover)
     PIXEL_DOT_COUNT = 8
     PIXEL_DOT_RADIUS = 22
     PIXEL_DOT_SIZE = 6
     SPIN_STEP_DEG = 6
     SPIN_INTERVAL_MS = 80
 
-    # NowPlayingBridge: kleiner C#/.NET-Hintergrundprozess, der Titel/Interpret/Cover
-    # ueber first-party WinRT liefert (siehe src/Program.cs). Muss einmalig gebaut
-    # werden (dotnet publish in src/ -> src/out/NowPlayingBridge.exe); ohne die .exe
-    # faellt NowPlayingReader automatisch auf reine Fenstertitel-Heuristik zurueck.
+    # NowPlayingBridge: small C#/.NET background process that provides title/
+    # artist/cover on Windows via first-party WinRT (see src/Program.cs). Must
+    # be built once (dotnet publish in src/ -> src/out/NowPlayingBridge.exe);
+    # without the .exe, NowPlayingReader falls back to a plain window-title
+    # heuristic on Windows. Not used on Linux (see NowPlayingReader).
     NOWPLAYING_BRIDGE_EXE = Path(__file__).resolve().parent / "out" / "NowPlayingBridge.exe"
     NOWPLAYING_CACHE_DIR = Path(__file__).resolve().parent.parent / "nowplaying_cache"
 
-    # Bekannte Media-Player-Prozesse, deren Fenstertitel nach "Interpret - Titel"
-    # durchsucht wird (Fallback ohne Bridge). Bei Bedarf einfach ergaenzen.
+    # Known media player processes whose window title is searched for "Artist -
+    # Title" (Windows fallback, used only if NowPlayingBridge.exe hasn't been
+    # built). Extend as needed.
     KNOWN_PLAYER_PROCESSES = {
         "spotify.exe", "vlc.exe", "foobar2000.exe", "wmplayer.exe",
         "musicbee.exe", "itunes.exe", "winamp.exe", "aimp.exe",
@@ -84,7 +86,7 @@ class parameters:
     COLOR_DARK = ACTIVE_SCHEME["ACCENT_DARK"]
     COLOR_STATUS_TEXT = ACTIVE_SCHEME["STATUS_TEXT"]
 
-    # --- UI-Layout ---
+    # --- UI layout ---
     CELL_WIDTH = 260
     CELL_HEIGHT = 90
     STATUS_LABEL_CHARS = 32
@@ -102,5 +104,5 @@ class parameters:
         "9: Laser Rotation",
     ]
 
-    # main.py liegt im Projekt-Root, config.py in <root>/src -- daher zwei Ebenen hoch
+    # main.py lives at the project root, config.py in <root>/src -- hence two levels up
     PRESETS_DIR = Path(__file__).resolve().parent.parent / "presets"

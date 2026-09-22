@@ -2,13 +2,13 @@
 DMX Controller & Presets
 =========================
 
-Nicht-UI-Schicht: kapselt den seriellen DMX512-Link zu einem USB-DMX-Adapter
-und verwaltet gespeicherte Kanal-Presets auf der Festplatte.
+Non-UI layer: wraps the serial DMX512 link to a USB-DMX adapter and manages
+saved channel presets on disk.
 
-Enthaelt zusaetzlich ein paar kleine Windows-only Anzeige-Helfer (DPI-Awareness,
-dunkle Titelleiste). Die liegen hier statt in ui.py, damit musicmode.py sie
-ebenfalls importieren kann, ohne einen Zirkelimport mit ui.py zu erzeugen
-(ui.py importiert MusicModeWindow aus musicmode.py).
+Also contains a few small Windows-only display helpers (DPI awareness, dark
+title bar). They live here rather than in ui.py so musicmode.py can import
+them too without creating a circular import with ui.py (ui.py imports
+MusicModeWindow from musicmode.py). All of them are no-ops on non-Windows.
 """
 
 import ctypes
@@ -22,14 +22,26 @@ import serial
 
 from .config import parameters
 
-_user32 = ctypes.windll.user32
-_dwmapi = ctypes.windll.dwmapi
 
-_user32.GetParent.argtypes = [wintypes.HWND]
-_user32.GetParent.restype = wintypes.HWND
+def _is_windows() -> bool:
+    return sys.platform == "win32"
 
-_dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
-_dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
+
+# Only touch ctypes.windll on Windows -- it doesn't exist on other platforms,
+# so referencing it unconditionally at import time would crash the whole
+# package on Linux/macOS before any platform check even runs.
+if _is_windows():
+    _user32 = ctypes.windll.user32
+    _dwmapi = ctypes.windll.dwmapi
+
+    _user32.GetParent.argtypes = [wintypes.HWND]
+    _user32.GetParent.restype = wintypes.HWND
+
+    _dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
+else:
+    _user32 = None
+    _dwmapi = None
 
 
 class Controller:
@@ -94,12 +106,8 @@ class PresetManager:
 # Windows-only visual fixes tkinter doesn't handle by itself: DPI awareness (fixes
 # blurry/blocky text on HiDPI displays) and a dark title bar to match the theme.
 # Both are no-ops on non-Windows.
-def _is_win() -> bool:
-    return sys.platform == "win32"
-
-
 def enable_dpi_awareness() -> None:
-    if not _is_win():
+    if not _is_windows():
         return
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
@@ -111,7 +119,7 @@ def enable_dpi_awareness() -> None:
 
 
 def apply_dark_titlebar(window) -> None:
-    if not _is_win():
+    if not _is_windows():
         return
     window.update_idletasks()
     hwnd = _user32.GetParent(window.winfo_id())
@@ -123,7 +131,7 @@ def apply_dark_titlebar(window) -> None:
 
 
 def force_dark_titlebar(window) -> None:
-    if not _is_win():
+    if not _is_windows():
         return
     window.update()
     try:

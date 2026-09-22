@@ -1,24 +1,25 @@
 // NowPlayingBridge
 // =================
-// Kleiner Hintergrund-Prozess, der die aktuell unter Windows spielende Media-
-// Session (SMTC -- dieselbe Quelle, die auch die Windows-Lautstaerke-Vorschau
-// zeigt) abfragt und Titel/Interpret/Cover periodisch in Dateien schreibt, die
-// die Python-App (musicmode.py) ausliest. Kapselt die WinRT-Zugriffe komplett
-// in .NET (first-party WinRT-Unterstuetzung ueber die "-windows"-TargetFramework),
-// damit Python keine eigene WinRT-Bindung (winsdk/winrt, archiviert) braucht.
+// Small background process that queries the currently playing media session
+// on Windows (SMTC -- the same source behind the Windows volume flyout
+// preview) and periodically writes title/artist/cover art to files that the
+// Python app (musicmode.py) reads. Encapsulates all WinRT access inside .NET
+// (first-party WinRT support via the "-windows" TargetFramework) so Python
+// doesn't need its own WinRT binding (winsdk/winrt, both archived).
 //
-// Aufruf: NowPlayingBridge.exe <ausgabe-ordner> [<intervall-ms>]
-// Schreibt in <ausgabe-ordner>:
+// Usage: NowPlayingBridge.exe <output-dir> [<interval-ms>]
+// Writes into <output-dir>:
 //   nowplaying.json        {"title": "...", "artist": "...", "hasCover": true/false}
-//   nowplaying_cover.img   Rohe Thumbnail-Bytes (Format je nach Quelle, meist PNG/JPEG,
-//                          PIL auf Python-Seite erkennt das automatisch)
+//   nowplaying_cover.img   Raw thumbnail bytes (format depends on the source,
+//                          usually PNG/JPEG; PIL on the Python side detects
+//                          the format automatically)
 //
-// Build (einmalig, braucht das .NET 8 SDK -- https://dotnet.microsoft.com/download):
+// Build (once, requires the .NET 8 SDK -- https://dotnet.microsoft.com/download):
 //   cd src
 //   dotnet publish -c Release -r win-x64 --self-contained false -o out
 //
-// Laeuft in einer Endlosschleife, bis der Prozess beendet wird (Python beendet
-// ihn beim Schliessen von Music Mode ueber subprocess.terminate()).
+// Runs in an infinite loop until the process is terminated (Python does this
+// when Music Mode closes, via subprocess.terminate()).
 
 using System.Text.Json;
 using Windows.Media.Control;
@@ -61,7 +62,7 @@ while (true)
     }
     catch
     {
-        // Keine laufende Session, kein Media-Player aktiv, o.ae. -- einfach naechste Runde versuchen
+        // No active session, no media player running, etc. -- just try again next round
         ClearIfNeeded();
     }
 

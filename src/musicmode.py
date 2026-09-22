@@ -2,49 +2,72 @@
 Music Mode
 ==========
 
-Eigenes Fenster (MusicModeWindow), das die Systemsounds (WASAPI-Loopback des
-aktuellen Ausgabegeräts) in Echtzeit analysiert, als Spektrum + Oszilloskop
-visualisiert, Bass/Mid/Treble/Beat/Pitch auf DMX-Kanäle mappen kann und dazu
-optional (Windows) Titel/Interpret des aktuell spielenden Tracks anzeigt.
+A standalone window (MusicModeWindow) that analyzes the system's audio
+output (loopback of the current playback device) in real time, visualizes it
+as a spectrum + oscilloscope, can map Bass/Mid/Treble/Beat/Pitch onto DMX
+channels, and optionally shows the title/artist/cover art of the track
+currently playing.
 
-Das Hauptfenster (DMXUI) wird beim Öffnen versteckt (root.withdraw()) und dient
-nur noch als Backend: Verbindung/Send-Loop laufen unverändert weiter, Kanalwerte
-werden über die vom Hauptfenster übergebenen Callbacks gesetzt.
+The main window (DMXUI) is hidden while this is open (root.withdraw()) and
+only keeps acting as the backend: the connection and send loop keep running
+unchanged, channel values are set through the callbacks passed in by the
+main window.
 
-Abhängigkeiten:
-    pip install PyAudioWPatch numpy
-    pip install pywin32   # optional, nur fuer Titel/Interpret (Windows-only)
+Dependencies:
+    pip install numpy pillow
+    # Windows:
+    pip install PyAudioWPatch pywin32   # pywin32 is optional, only used as a
+                                         # fallback for title/artist (see below)
+    # Linux:
+    pip install pyaudio jeepney         # jeepney is optional, only used for
+                                         # title/artist/cover via MPRIS
 
-Hinweis Plattform:
-- Windows: Loopback-Audio laeuft ohne weitere Einrichtung (WASAPI-Loopback des
-  Default-Ausgabegeraets, per PyAudioWPatch/PortAudio).
-- macOS/Linux: keine WASAPI-Loopback -- AudioAnalyzer.start() liefert dann
-  einen Fehler (ueber on_frame(AudioFrame(error=...))), der Rest der UI
-  bleibt aber benutzbar. Kein Titel/Interpret.
+Platform notes:
+- Windows: loopback audio works out of the box (WASAPI loopback of the
+  default playback device, via PyAudioWPatch/PortAudio).
+- Linux: uses the PulseAudio/PipeWire "Monitor of <sink>" source (via plain
+  PyAudio/PortAudio) -- works as long as PulseAudio, or PipeWire with its
+  PulseAudio compatibility layer, is running. This is groundwork/best-effort:
+  I couldn't test it against a real PulseAudio/PipeWire setup myself, so if
+  device detection fails, check `pactl list sources short` for the exact
+  monitor source name and adjust _resolve_loopback_device_linux if needed.
+- macOS: neither path applies; AudioAnalyzer.start() reports an error via
+  on_frame(AudioFrame(error=...)), the rest of the UI stays usable.
 
-Die Titel/Interpret/Cover-Anzeige nutzt primaer NowPlayingBridge.exe, einen
-kleinen C#/.NET-Hintergrundprozess (siehe src/Program.cs),
-der first-party WinRT anspricht -- dieselbe SMTC-Quelle wie die Windows-
-Lautstaerke-Vorschau. Grund: winsdk/winrt (die Python-WinRT-Bindungen) sind
-archiviert und haben fuer neuere Python-Versionen keine fertigen Wheels mehr.
-.NET hat WinRT-Unterstuetzung dagegen first-party und aktiv gepflegt. Python
-selbst spricht dabei kein COM/WinRT -- es startet die .exe als Subprozess und
-liest deren JSON-/Cover-Ausgabedateien per stinknormalem Datei-I/O.
-Ist NowPlayingBridge.exe noch nicht gebaut (siehe Docstring dort), faellt
-NowPlayingReader automatisch auf eine reine Fenstertitel-Heuristik zurueck
-(parameters.KNOWN_PLAYER_PROCESSES, z.B. "Interpret - Titel" bei Spotify) --
-dann gibt's Titel/Interpret, aber kein Cover. Ohne Cover zeigt die Scheibe
-eine kleine rotierende Pixel-Art-Animation statt eines leeren Kreises.
+Title/artist/cover art:
+- Windows (primary): starts NowPlayingBridge.exe, a small C#/.NET background
+  process (see src/Program.cs) that talks to the Windows Media Control APIs
+  (SMTC, first-party WinRT) -- the same source behind the Windows volume
+  flyout preview. Reason for going through .NET instead of a Python WinRT
+  binding: winsdk/winrt are archived and no longer ship wheels for recent
+  Python versions, while .NET has first-party, actively maintained WinRT
+  support. Python itself never speaks COM/WinRT here -- it just launches the
+  .exe as a subprocess and reads its JSON/cover output files.
+  If NowPlayingBridge.exe hasn't been built yet, falls back to a plain
+  window-title heuristic over known player processes
+  (parameters.KNOWN_PLAYER_PROCESSES, e.g. "Artist - Title" for Spotify) --
+  title/artist only, no cover.
+- Linux: queries MPRIS (the freedesktop.org media-player D-Bus standard) via
+  `jeepney`, a pure-Python D-Bus library. Most Linux media players (browsers,
+  VLC, Spotify, most desktop players) implement MPRIS, so this tends to have
+  broader coverage than the Windows window-title fallback. Cover art comes
+  through as a `file://` or `http(s)://` URL (`mpris:artUrl`); this is also
+  groundwork/best-effort, since I couldn't test it against a real D-Bus
+  session -- if the exact property/message shapes turn out to differ, treat
+  _fetch_mpris_metadata as the place to adjust.
+- Without a cover, the disc shows a small rotating pixel-art animation
+  instead of an empty circle.
 
-Threading-Modell:
-- Die Audioaufnahme laeuft NICHT in einem eigenen Python-Thread: PyAudioWPatch
-  (PortAudio) ruft AudioAnalyzer._audio_callback direkt aus seinem eigenen
-  nativen Audio-Thread auf, sobald ein Block bereitsteht.
-- Now-Playing-Abfrage laeuft in einem eigenen Daemon-Thread (NowPlayingReader._loop),
-  der entweder NowPlayingBridge.exe pollt oder (Fallback) Fenstertitel scannt.
-- Ergebnisse gehen NICHT direkt in Tkinter, sondern ueber Callbacks nach
-  draussen; MusicModeWindow marshallt sie per self.after(0, ...) in den
-  GUI-Thread zurueck
+Threading model:
+- Audio capture does NOT run in its own Python thread: PyAudio/PortAudio
+  calls AudioAnalyzer._audio_callback directly from its own native audio
+  thread whenever a block is ready.
+- Now-playing lookup runs in its own daemon thread (NowPlayingReader._loop),
+  which either polls NowPlayingBridge.exe's output files, scans window
+  titles, or queries MPRIS, depending on platform/availability.
+- Results are never pushed into Tkinter directly; they go through callbacks,
+  and MusicModeWindow marshals them back onto the GUI thread via
+  self.after(0, ...).
 """
 
 import io
@@ -52,18 +75,26 @@ import json
 import logging
 import math
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import ttk
 
 import numpy as np
-import pyaudiowpatch as pyaudio
 
 from .config import parameters
 from .controller import apply_dark_titlebar
+
+_IS_WINDOWS = sys.platform == "win32"
+
+if _IS_WINDOWS:
+    import pyaudiowpatch as pyaudio
+else:
+    import pyaudio
 
 try:
     from PIL import Image, ImageDraw, ImageTk
@@ -71,19 +102,34 @@ try:
 except Exception:
     _PIL_AVAILABLE = False
 
+# Windows fallback: reading the window title of a known player process
 try:
-    import win32gui
-    import win32process
-    import win32api
-    import win32con
-    _MEDIA_AVAILABLE = True
+    if _IS_WINDOWS:
+        import win32gui
+        import win32process
+        import win32api
+        import win32con
+        _WIN32_AVAILABLE = True
+    else:
+        _WIN32_AVAILABLE = False
 except Exception:
-    _MEDIA_AVAILABLE = False
+    _WIN32_AVAILABLE = False
+
+# Linux: MPRIS over D-Bus via jeepney (pure Python, no system dev packages needed)
+try:
+    if not _IS_WINDOWS:
+        from jeepney import DBusAddress, new_method_call
+        from jeepney.io.blocking import open_dbus_connection
+        _DBUS_AVAILABLE = True
+    else:
+        _DBUS_AVAILABLE = False
+except Exception:
+    _DBUS_AVAILABLE = False
 
 
 @dataclass
 class AudioFrame:
-    """Ein Analyseergebnis fuer einen Audio-Block."""
+    """One analysis result for a single audio block."""
     bass: float = 0.0
     mid: float = 0.0
     treble: float = 0.0
@@ -95,33 +141,33 @@ class AudioFrame:
 
 
 class AudioAnalyzer:
-    """Nimmt System-Loopback-Audio auf und berechnet daraus mehrere Live-Kennzahlen:
-    - bass/mid/treble: geglaettete Energie in drei Frequenzbaendern (0..1)
-    - beat: kurzer, abklingender Puls bei ploetzlichem Energieanstieg
-      (einfache Onset-Erkennung, kein echtes BPM-Tracking)
-    - pitch: normalisierter Spektralschwerpunkt (0=dumpf/bassig, 1=hell/hochfrequent) --
-      eher fuer kontinuierliche Rotations-/Speed-Parameter geeignet als eine Bandenergie
-    - bars: Spektrum in log-verteilten Baendern, fuers Balken-Display
-    - waveform: kurzer Ausschnitt der Rohsamples, fuers Oszilloskop-Display
+    """Captures system loopback audio and computes several live metrics from it:
+    - bass/mid/treble: smoothed energy in three frequency bands (0..1)
+    - beat: a short, decaying pulse on sudden energy spikes
+      (simple onset detection, not real BPM tracking)
+    - pitch: normalized spectral centroid (0 = dull/bassy, 1 = bright/high-frequency) --
+      better suited to continuous rotation/speed parameters than a plain band energy
+    - bars: spectrum split into log-spaced bands, for the bar display
+    - waveform: a short slice of the raw samples, for the oscilloscope display
 
-    Nutzt PyAudioWPatch (dedizierter WASAPI-Loopback-Fork von PyAudio) statt
-    sounddevice: dessen WasapiSettings(loopback=True) existiert schlicht nicht
-    als High-Level-API -- das war ein Fehler meinerseits. PortAudio/PyAudio
-    ruft _audio_callback direkt aus seinem eigenen nativen Audio-Thread auf,
-    sobald ein Block bereitsteht -- kein eigener threading.Thread noetig.
-    (Davor: soundcard, das auf manchen Geraeten mit STATUS_HEAP_CORRUPTION
-    abstuerzte.)
+    On Windows, uses PyAudioWPatch (a dedicated WASAPI-loopback fork of
+    PyAudio). On Linux, uses plain PyAudio against the PulseAudio/PipeWire
+    "Monitor of <sink>" source, which PortAudio exposes as an ordinary input
+    device -- no special loopback flag is needed there. Either way,
+    PyAudio/PortAudio calls _audio_callback directly from its own native
+    audio thread once a block is ready, so no dedicated threading.Thread is
+    needed here.
     """
 
     def __init__(self, on_frame, blocksize: int = parameters.BLOCK_SIZE,
                  gain: float = 1.5, smoothing: float = 0.7, n_bars: int = parameters.N_BARS):
         self.on_frame = on_frame            # callback(frame: AudioFrame)
         self.blocksize = blocksize
-        self.gain = gain                    # Empfindlichkeit, live aenderbar
-        self.smoothing = smoothing          # 0..~0.95, hoeher = traeger/ruhiger
+        self.gain = gain                    # sensitivity, adjustable live
+        self.smoothing = smoothing          # 0..~0.95, higher = slower/smoother
         self.n_bars = n_bars
-        self.samplerate = parameters.SAMPLE_RATE  # Platzhalter, wird in start() durchs echte Geraet ersetzt
-        self._channels = 2                  # Platzhalter, wird in start() durchs echte Geraet ersetzt
+        self.samplerate = parameters.SAMPLE_RATE  # placeholder, replaced in start() by the real device
+        self._channels = 2                  # placeholder, replaced in start() by the real device
 
         self._running = False
         self._pa = None
@@ -179,23 +225,37 @@ class AudioAnalyzer:
 
     @staticmethod
     def _resolve_loopback_device(p) -> dict:
-        try:
-            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-        except OSError as e:
-            raise RuntimeError("WASAPI ist auf diesem System nicht verfuegbar") from e
+        if _IS_WINDOWS:
+            try:
+                wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            except OSError as e:
+                raise RuntimeError("WASAPI is not available on this system") from e
 
-        default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-        if default_speakers["isLoopbackDevice"]:
-            return default_speakers
+            default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            if default_speakers["isLoopbackDevice"]:
+                return default_speakers
 
-        for loopback in p.get_loopback_device_info_generator():
-            if default_speakers["name"] in loopback["name"]:
-                return loopback
+            for loopback in p.get_loopback_device_info_generator():
+                if default_speakers["name"] in loopback["name"]:
+                    return loopback
 
-        raise RuntimeError("Kein passendes WASAPI-Loopback-Geraet gefunden")
+            raise RuntimeError("No matching WASAPI loopback device found")
+
+        # Linux: PortAudio's PulseAudio/PipeWire host API exposes the "Monitor
+        # of <sink>" source as a completely ordinary input device -- no
+        # special loopback flag needed, just find it by name.
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) > 0 and "monitor" in info.get("name", "").lower():
+                return info
+
+        raise RuntimeError(
+            "No PulseAudio/PipeWire monitor source found. Make sure PulseAudio, "
+            "or PipeWire with its PulseAudio compatibility layer, is running."
+        )
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
-        # Laeuft im nativen PortAudio-Thread, nicht in einem von uns gestarteten Thread
+        # Runs on PortAudio's own native thread, not a thread we started ourselves
         samples = np.frombuffer(in_data, dtype=np.float32)
         if self._channels > 1:
             samples = samples.reshape(-1, self._channels).mean(axis=1)
@@ -221,7 +281,7 @@ class AudioAnalyzer:
             level = min(1.0, energy * self.gain)
             self._bar_levels[i] = self.smoothing * self._bar_levels[i] + (1 - self.smoothing) * level
 
-        # Beat/Onset: Gesamtenergie vs. ihr gleitender Mittelwert der letzten ~1s
+        # Beat/onset: total energy vs. its rolling average over the last ~1s
         total_energy = float(np.sqrt(np.mean(spectrum ** 2)))
         avg_energy = float(np.mean(self._energy_history)) if self._energy_history else 0.0
         self._energy_history.append(total_energy)
@@ -229,7 +289,7 @@ class AudioAnalyzer:
                     and total_energy > parameters.BEAT_MIN_ENERGY)
         self._beat_level = max(1.0 if is_onset else 0.0, self._beat_level * parameters.BEAT_DECAY)
 
-        # Pitch: normalisierter Spektralschwerpunkt (0=bassig, 1=hell)
+        # Pitch: normalized spectral centroid (0 = bassy, 1 = bright)
         magnitude_sum = float(np.sum(spectrum))
         centroid = float(np.sum(freqs * spectrum) / magnitude_sum) if magnitude_sum > 0 else 0.0
         pitch_norm = min(1.0, centroid / parameters.PITCH_REFERENCE_HZ)
@@ -245,6 +305,8 @@ class AudioAnalyzer:
         ))
 
 
+# --------- Windows fallback: window-title heuristic ---------
+
 def _get_process_name(pid: int) -> str:
     try:
         handle = win32api.OpenProcess(
@@ -259,8 +321,9 @@ def _get_process_name(pid: int) -> str:
 
 
 def _find_now_playing_title() -> str | None:
-    """Sucht unter den sichtbaren Top-Level-Fenstern eines bekannten Media-Players
-    (parameters.KNOWN_PLAYER_PROCESSES) und gibt dessen Fenstertitel zurueck, oder None."""
+    """Scans visible top-level windows for one belonging to a known media
+    player process (parameters.KNOWN_PLAYER_PROCESSES) and returns its window
+    title, or None."""
     found = []
 
     def _callback(hwnd, _):
@@ -284,25 +347,75 @@ def _find_now_playing_title() -> str | None:
 
 
 def _parse_title(raw: str) -> tuple[str, str]:
-    # Gaengiges Format vieler Player: "Interpret - Titel"
+    # Common format used by many players: "Artist - Title"
     if " - " in raw:
         artist, _, title = raw.partition(" - ")
         return artist.strip(), title.strip()
     return "", raw.strip()
 
 
+# --------- Linux: MPRIS over D-Bus ---------
+
+def _fetch_mpris_metadata():
+    """Queries the first available MPRIS player on the session bus for its
+    current Metadata (title, artist, cover art URL). Returns None if no MPRIS
+    player is currently registered. Best-effort/untested against a real D-Bus
+    session -- see module docstring."""
+    conn = open_dbus_connection(bus="SESSION")
+    try:
+        bus_addr = DBusAddress("/org/freedesktop/DBus", bus_name="org.freedesktop.DBus",
+                                interface="org.freedesktop.DBus")
+        names_reply = conn.send_and_get_reply(new_method_call(bus_addr, "ListNames"))
+        names = [n for n in names_reply.body[0] if n.startswith("org.mpris.MediaPlayer2.")]
+        if not names:
+            return None
+
+        player_addr = DBusAddress("/org/mpris/MediaPlayer2", bus_name=names[0],
+                                   interface="org.freedesktop.DBus.Properties")
+        get_msg = new_method_call(player_addr, "Get", "ss",
+                                   ("org.mpris.MediaPlayer2.Player", "Metadata"))
+        reply = conn.send_and_get_reply(get_msg)
+        metadata = reply.body[0][1]  # ("a{sv}", {...}) -> the actual dict
+
+        title = metadata.get("xesam:title", ("s", ""))[1]
+        artist_list = metadata.get("xesam:artist", ("as", []))[1]
+        artist = ", ".join(artist_list) if artist_list else ""
+        art_url = metadata.get("mpris:artUrl", ("s", ""))[1]
+        return title, artist, art_url
+    finally:
+        conn.close()
+
+
+def _load_art_bytes(art_url: str):
+    if not art_url:
+        return None
+    try:
+        if art_url.startswith("file://"):
+            import urllib.parse
+            path = urllib.parse.unquote(art_url[len("file://"):])
+            return Path(path).read_bytes()
+        if art_url.startswith(("http://", "https://")):
+            import urllib.request
+            with urllib.request.urlopen(art_url, timeout=2) as response:
+                return response.read()
+    except Exception:
+        return None
+    return None
+
+
 class NowPlayingReader:
-    """Liefert Titel/Interpret/Cover des aktuell spielenden Tracks.
+    """Provides title/artist/cover art of the currently playing track.
 
-    Primaer: startet NowPlayingBridge.exe (C#/.NET, first-party WinRT) als
-    Hintergrundprozess und pollt deren JSON-/Cover-Ausgabedateien -- liefert
-    Titel, Interpret UND Cover-Art (dieselbe Quelle wie die Windows-Vorschau).
+    Windows (primary): starts NowPlayingBridge.exe as a background process
+    and polls its JSON/cover output files -- provides title, artist AND cover
+    art (the same source behind the Windows volume flyout preview).
+    Windows (fallback, if parameters.NOWPLAYING_BRIDGE_EXE hasn't been built
+    yet): plain window-title heuristic over known media player processes
+    (parameters.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for Spotify --
+    title/artist only, no cover. Stays inactive without pywin32.
 
-    Fallback (falls parameters.NOWPLAYING_BRIDGE_EXE nicht existiert, also noch
-    nicht gebaut wurde): reine Fenstertitel-Heuristik ueber bekannte Media-
-    Player-Prozesse (parameters.KNOWN_PLAYER_PROCESSES), z.B. "Interpret -
-    Titel" bei Spotify -- liefert nur Titel/Interpret, kein Cover. Ohne pywin32
-    bleibt auch dieser Fallback inaktiv, on_update wird dann nie aufgerufen.
+    Linux: queries MPRIS over D-Bus via `jeepney` -- title, artist and cover
+    art (as a file:// or http(s):// URL). Stays inactive without jeepney.
     """
 
     def __init__(self, on_update, poll_interval: float = 1.0):
@@ -312,12 +425,13 @@ class NowPlayingReader:
         self._thread = None
         self._process = None
         self._last_signature = None
-        self._use_bridge = parameters.NOWPLAYING_BRIDGE_EXE.exists()
+        self._use_bridge = _IS_WINDOWS and parameters.NOWPLAYING_BRIDGE_EXE.exists()
+        self._use_mpris = not _IS_WINDOWS and _DBUS_AVAILABLE
 
     def start(self) -> None:
         if self._running:
             return
-        if not self._use_bridge and not _MEDIA_AVAILABLE:
+        if not (self._use_bridge or self._use_mpris or _WIN32_AVAILABLE):
             return
         self._running = True
         if self._use_bridge:
@@ -344,7 +458,7 @@ class NowPlayingReader:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except Exception:
-            logging.exception("NowPlayingBridge.exe konnte nicht gestartet werden")
+            logging.exception("Failed to start NowPlayingBridge.exe")
             self._process = None
             self._use_bridge = False
 
@@ -352,6 +466,8 @@ class NowPlayingReader:
         while self._running:
             if self._use_bridge:
                 self._poll_bridge_files()
+            elif self._use_mpris:
+                self._poll_mpris()
             else:
                 raw = _find_now_playing_title()
                 if raw and raw != self._last_signature:
@@ -384,10 +500,27 @@ class NowPlayingReader:
 
         self.on_update(title, artist, cover_bytes)
 
+    def _poll_mpris(self) -> None:
+        try:
+            metadata = _fetch_mpris_metadata()
+        except Exception:
+            return
+        if metadata is None:
+            return
+
+        title, artist, art_url = metadata
+        signature = (title, artist, art_url)
+        if signature == self._last_signature:
+            return
+        self._last_signature = signature
+
+        cover_bytes = _load_art_bytes(art_url) if art_url else None
+        self.on_update(title, artist, cover_bytes)
+
 
 class MusicModeWindow(tk.Toplevel):
-    """Eigenstaendiges Fenster: Spektrum + Oszilloskop nebeneinander, Scheibe mit
-    Titel/Interpret darunter, Kanal-Mapping und Start/Stop-Settings."""
+    """Standalone window: spectrum + oscilloscope side by side, a disc with
+    title/artist below, channel mapping, and start/stop settings."""
 
     def __init__(self, parent: tk.Tk, channel_names: dict, set_channel_value,
                  restore_sliders, on_closed, colors: dict):
@@ -395,10 +528,10 @@ class MusicModeWindow(tk.Toplevel):
         channel_names:     {channel_nr: "1: Show Select", ...}
         set_channel_value: callback(channel: int, value: int) -> None
         restore_sliders:   callback(channels: list[int]) -> None
-        on_closed:         callback() -> None, wird beim Schliessen dieses Fensters
-                            aufgerufen (Hauptfenster soll sich dann wieder zeigen)
-        colors:             dict mit BG/BG_LIGHT/FG/ACCENT/ACCENT_DARK/STATUS_TEXT
-                            (gleiche Form wie parameters.ACTIVE_SCHEME)
+        on_closed:         callback() -> None, called when this window closes
+                            (the main window should show itself again then)
+        colors:             dict with BG/BG_LIGHT/FG/ACCENT/ACCENT_DARK/STATUS_TEXT
+                            (same shape as parameters.ACTIVE_SCHEME)
         """
         super().__init__(parent)
         self.title("Music Mode")
@@ -424,7 +557,7 @@ class MusicModeWindow(tk.Toplevel):
 
         self.analyzer.start()
 
-    # --------- Aufbau
+    # --------- Layout
     def _build(self) -> None:
         viz = ttk.LabelFrame(self, text="Now Playing", padding=10)
         viz.pack(fill="x", padx=10, pady=(10, 5))
@@ -459,8 +592,8 @@ class MusicModeWindow(tk.Toplevel):
             self.disc_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
                                           outline=colors["ACCENT_DARK"], width=1)
 
-        # Kleine rotierende Pixel-Art-Punkte als Fallback-"Label", solange kein
-        # echtes Cover vorliegt (siehe Modul-Docstring)
+        # Small rotating pixel-art dots as a fallback "label" while no real
+        # cover art is available (see module docstring)
         self._pixel_ids = []
         for i in range(parameters.PIXEL_DOT_COUNT):
             color = colors["ACCENT"] if i % 2 == 0 else colors["ACCENT_DARK"]
@@ -469,19 +602,20 @@ class MusicModeWindow(tk.Toplevel):
         self.disc_canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
                                       fill=colors["FG"], outline="")
 
-        # Cover-Image liegt zuletzt im Zeichen-Stapel -> ueberdeckt die Pixel-
-        # Punkte automatisch, sobald ein Cover gesetzt wird (image=None zeichnet nichts)
+        # The cover image sits last in the draw order -> automatically covers
+        # the pixel dots once a cover is actually set (image=None draws nothing)
         self._cover_image_item = self.disc_canvas.create_image(cx, cy, image=None)
-        self._cover_photo = None   # Referenz halten, sonst raeumt Tkinter das Bild weg
-        self._base_cover = None    # zirkulaer maskiertes, ungedrehtes PIL-Image
+        self._cover_photo = None   # keep a reference, or Tkinter garbage-collects the image
+        self._base_cover = None    # circularly masked, unrotated PIL image
         self._disc_angle = 0.0
 
         self.track_label = ttk.Label(parent, text="", font=("Segoe UI", 9, "bold"),
                                       wraplength=size + 20, justify="center")
         self.track_label.pack(pady=(5, 0))
 
-        if not _MEDIA_AVAILABLE and not parameters.NOWPLAYING_BRIDGE_EXE.exists():
-            self.track_label.config(text="(NowPlayingBridge.exe fehlt, pywin32 fehlt -> kein Titel)")
+        have_now_playing_source = parameters.NOWPLAYING_BRIDGE_EXE.exists() or _WIN32_AVAILABLE or _DBUS_AVAILABLE
+        if not have_now_playing_source:
+            self.track_label.config(text="(no title source available)")
         else:
             self.now_playing = NowPlayingReader(on_update=self._on_now_playing)
             self.now_playing.start()
@@ -581,20 +715,20 @@ class MusicModeWindow(tk.Toplevel):
                 return ch
         return None
 
-    # --------- Settings-Callbacks
+    # --------- Settings callbacks
     def _on_gain_change(self, value) -> None:
         self.analyzer.gain = float(value)
 
     def _on_smoothing_change(self, value) -> None:
         self.analyzer.smoothing = float(value)
 
-    # --------- Audio-Frames (Worker-Thread -> GUI-Thread)
+    # --------- Audio frames (worker thread -> GUI thread)
     def _on_frame(self, frame: AudioFrame) -> None:
         self.after(0, self._apply_frame, frame)
 
     def _apply_frame(self, frame: AudioFrame) -> None:
         if frame.error is not None:
-            logging.error("Music Mode Audiofehler", exc_info=frame.error)
+            logging.error("Music Mode audio error", exc_info=frame.error)
             self.status_label.config(text=f"Audio error: {frame.error}")
             self.analyzer.stop()
             return
@@ -612,8 +746,8 @@ class MusicModeWindow(tk.Toplevel):
                 current_channels.add(channel)
                 self.set_channel_value(channel, int(level * 255))
 
-        # Mapping kann waehrend des Laufs geaendert werden -> Slider freigeben,
-        # die gerade nicht mehr gemappt sind
+        # Mapping can change while running -> release sliders that are no
+        # longer mapped to anything
         freed = self._active_channels - current_channels
         if freed:
             self.restore_sliders(list(freed))
@@ -664,10 +798,10 @@ class MusicModeWindow(tk.Toplevel):
             img.putalpha(mask)
             self._base_cover = img
         except Exception:
-            logging.exception("Cover konnte nicht verarbeitet werden")
+            logging.exception("Failed to process cover art")
             self._base_cover = None
 
-    # --------- Schliessen
+    # --------- Closing
     def _on_close(self) -> None:
         self.analyzer.stop()
         if self.now_playing:
