@@ -55,6 +55,8 @@ class DMXUI:
         self._build_preset_bar()
         self._size_to_content()
 
+        self._open_music_mode()
+
     # channel value -> readable state
     @staticmethod
     def describe(channel: int, value: int) -> str:

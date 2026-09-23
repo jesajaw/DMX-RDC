@@ -3,13 +3,17 @@
 # and periodically writes title/artist/album/cover art to files that the
 # Python app (musicmode.py) reads.
 #
-# The JSON cache also keeps the last 3 distinct songs in debugHistory so that
-# cover/media errors remain available for debugging instead of being lost on
-# the next polling cycle.
+# Pass -IncludeDebugInfo to also write per-stage error details (debug) and the
+# last 3 distinct tracks' cover/media errors (debugHistory) into nowplaying.json
+# -- off by default, so the JSON that ships normally stays small and doesn't
+# carry internal error strings. Useful for diagnosing why title/artist or
+# cover art aren't showing up:
+#   powershell -File NowPlayingBridge.ps1 <output-dir> <interval-ms> -IncludeDebugInfo
 
 param(
     [string]$OutputDir = $PSScriptRoot,
-    [int]$IntervalMs = 2000
+    [int]$IntervalMs = 2000,
+    [switch]$IncludeDebugInfo
 )
 
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -20,12 +24,11 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
 [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
 [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
-[Windows.Storage.Streams.IBuffer, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
-[Windows.Storage.Streams.IInputStream, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+[Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
 [Windows.Storage.Streams.IRandomAccessStreamWithContentType, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
 
 # ---------------------------------------------------------------------------
-# WinRT async helpers
+# WinRT async helper
 # ---------------------------------------------------------------------------
 
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
@@ -38,24 +41,6 @@ function Await-WinRtTask($WinRtTask, [type]$ResultType) {
     $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
     $netTask = $asTask.Invoke($null, @($WinRtTask))
     $netTask.Wait(-1) | Out-Null
-    return $netTask.Result
-}
-
-$asTaskProgressGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-    $_.Name -eq 'AsTask' -and
-    $_.GetParameters().Count -eq 1 -and
-    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperationWithProgress`2'
-})[0]
-
-function Await-WinRtProgress($WinRtTask, [type]$ResultType, [type]$ProgressType) {
-    $asTask = $asTaskProgressGeneric.MakeGenericMethod(
-        $ResultType,
-        $ProgressType
-    )
-
-    $netTask = $asTask.Invoke($null, @($WinRtTask))
-    $netTask.Wait(-1) | Out-Null
-
     return $netTask.Result
 }
 
@@ -100,13 +85,37 @@ if (Test-Path -LiteralPath $jsonPath) {
 
 function Write-Result($Result) {
 
-    # Keep debugHistory as an array.
-    [object[]]$Result.debugHistory = @($script:debugHistory)
+    if ($IncludeDebugInfo) {
+        # Keep debugHistory as an array.
+        [object[]]$Result.debugHistory = @($script:debugHistory)
+    }
+    else {
+        # Debug info is opt-in -- strip it so the JSON that ships by default
+        # stays small and doesn't leak internal error strings.
+        $Result.Remove('debug') | Out-Null
+        $Result.Remove('debugHistory') | Out-Null
+    }
 
-    # Normal direct write, same approach as the original working script.
-    $Result |
-        ConvertTo-Json -Depth 10 -Compress |
-        Set-Content -Path $jsonPath -Encoding UTF8
+    # No -Compress: pretty-printed JSON is much easier to read/diff while debugging.
+    $json = $Result | ConvertTo-Json -Depth 10
+
+    # Set-Content can transiently fail with a sharing violation if another
+    # process (Python reading it, or a second bridge instance) has the file
+    # open at the exact same moment -- a short retry clears this up almost
+    # always, since these locks are typically held for microseconds.
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            Set-Content -Path $jsonPath -Value $json -Encoding UTF8 -ErrorAction Stop
+            return
+        }
+        catch {
+            if ($attempt -eq $maxAttempts) {
+                throw
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    }
 }
 
 function Add-DebugHistory($Entry) {
@@ -137,16 +146,13 @@ function Clear-IfNeeded {
     $script:lastKey = $null
 
     $result = @{
-        title        = ""
-        artist       = ""
-        album        = ""
-        hasCover     = $false
-        debugHistory = [object[]]$script:debugHistory
+        title    = ""
+        artist   = ""
+        album    = ""
+        hasCover = $false
     }
 
-    $result |
-        ConvertTo-Json -Depth 10 -Compress |
-        Set-Content -Path $jsonPath -Encoding UTF8
+    Write-Result $result
 
     if (Test-Path $coverPath) {
         Remove-Item $coverPath -Force
@@ -271,56 +277,33 @@ while ($true) {
                             $size = [uint32]$streamSize
 
                             # ------------------------------------------------
-                            # Prepare WinRT buffer
+                            # Read via DataReader -- a concrete WinRT class,
+                            # so PowerShell can call its methods directly
+                            # (no interface reflection needed, unlike raw
+                            # IInputStream.ReadAsync on the stream itself,
+                            # which failed with a ComObject dispatch error --
+                            # DataReader wraps that complexity internally)
                             # ------------------------------------------------
 
-                            $bytes = New-Object byte[] ([int]$size)
+                            $reader = [Windows.Storage.Streams.DataReader]::new($stream)
 
-                            $buffer =
-                                [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]::AsBuffer(
-                                    $bytes
-                                )
+                            try {
+                                $loadTask = $reader.LoadAsync($size)
+                                $loaded = Await-WinRtTask $loadTask ([uint32])
 
-                            # ------------------------------------------------
-                            # Invoke IInputStream.ReadAsync through reflection
-                            # ------------------------------------------------
+                                if ($loaded -eq 0) {
+                                    throw "DataReader.LoadAsync loaded 0 bytes."
+                                }
 
-                            $readMethod =
-                                [Windows.Storage.Streams.IInputStream].GetMethod(
-                                    "ReadAsync",
-                                    [type[]]@(
-                                        [Windows.Storage.Streams.IBuffer],
-                                        [uint32],
-                                        [Windows.Storage.Streams.InputStreamOptions]
-                                    )
-                                )
-
-                            if ($null -eq $readMethod) {
-                                throw "Could not locate IInputStream.ReadAsync."
+                                $bytes = New-Object byte[] ([int]$loaded)
+                                $reader.ReadBytes($bytes)
                             }
-
-                            $readOperation = $readMethod.Invoke(
-                                $stream,
-                                @(
-                                    $buffer,
-                                    $size,
-                                    [Windows.Storage.Streams.InputStreamOptions]::None
-                                )
-                            )
-
-                            $readBuffer = Await-WinRtProgress `
-                                $readOperation `
-                                ([Windows.Storage.Streams.IBuffer]) `
-                                ([System.UInt32])
-
-                            if ($null -eq $readBuffer) {
-                                throw "ReadAsync returned no buffer."
+                            finally {
+                                try { $reader.Dispose() } catch { }
                             }
-
-                            $bytes = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]::ToArray($readBuffer)
 
                             if ($null -eq $bytes -or $bytes.Length -eq 0) {
-                                throw "ReadAsync returned an empty buffer."
+                                throw "DataReader returned an empty buffer."
                             }
 
                             # ------------------------------------------------

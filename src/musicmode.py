@@ -456,7 +456,7 @@ class NowPlayingReader:
         cache_dir.mkdir(exist_ok=True)
         try:
             self._process = subprocess.Popen(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-IncludeDebugInfo",
                  "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
                  str(cache_dir), str(int(self.poll_interval * 1000))],
                 creationflags=subprocess.CREATE_NO_WINDOW,
