@@ -1,4 +1,4 @@
-# Python build artifacts (not __pycache__, see project decision)
+# Python build artifacts
 *.egg-info/
 build/
 dist/
@@ -16,5 +16,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Runtime cache of NowPlayingBridge.ps1 (title/cover cache)
+# Runtime cache of NowPlayingBridge.ps1
 nowplaying_cache/
