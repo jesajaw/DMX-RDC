@@ -1,5 +1,3 @@
-# NowPlayingBridge.ps1
-# =====================
 # Small background script that queries the currently playing media session on
 # Windows (SMTC -- the same source behind the Windows volume flyout preview)
 # and periodically writes title/artist/cover art to files that the Python app
