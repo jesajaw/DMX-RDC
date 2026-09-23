@@ -54,17 +54,19 @@ class parameters:
     SPIN_STEP_DEG = 6
     SPIN_INTERVAL_MS = 80
 
-    # NowPlayingBridge: small C#/.NET background process that provides title/
-    # artist/cover on Windows via first-party WinRT (see src/Program.cs). Must
-    # be built once (dotnet publish in src/ -> src/out/NowPlayingBridge.exe);
-    # without the .exe, NowPlayingReader falls back to a plain window-title
-    # heuristic on Windows. Not used on Linux (see NowPlayingReader).
-    NOWPLAYING_BRIDGE_EXE = Path(__file__).resolve().parent / "out" / "NowPlayingBridge.exe"
+    # NowPlayingBridge: small PowerShell background script that provides title/
+    # artist/cover on Windows via WinRT (Windows.Media.Control, see
+    # src/NowPlayingBridge.ps1). Needs no install/build step -- PowerShell and
+    # Windows.Media.Control are part of every Windows install. If the script
+    # is missing entirely, or PowerShell itself is unavailable, NowPlayingReader
+    # falls back to a plain window-title heuristic on Windows. Not used on
+    # Linux (see NowPlayingReader).
+    NOWPLAYING_BRIDGE_SCRIPT = Path(__file__).resolve().parent / "NowPlayingBridge.ps1"
     NOWPLAYING_CACHE_DIR = Path(__file__).resolve().parent.parent / "nowplaying_cache"
 
     # Known media player processes whose window title is searched for "Artist -
-    # Title" (Windows fallback, used only if NowPlayingBridge.exe hasn't been
-    # built). Extend as needed.
+    # Title" (Windows fallback, used only if NowPlayingBridge.ps1 is missing
+    # or PowerShell is unavailable). Extend as needed.
     KNOWN_PLAYER_PROCESSES = {
         "spotify.exe", "vlc.exe", "foobar2000.exe", "wmplayer.exe",
         "musicbee.exe", "itunes.exe", "winamp.exe", "aimp.exe",

@@ -35,16 +35,18 @@ Platform notes:
   on_frame(AudioFrame(error=...)), the rest of the UI stays usable.
 
 Title/artist/cover art:
-- Windows (primary): starts NowPlayingBridge.exe, a small C#/.NET background
-  process (see src/Program.cs) that talks to the Windows Media Control APIs
-  (SMTC, first-party WinRT) -- the same source behind the Windows volume
-  flyout preview. Reason for going through .NET instead of a Python WinRT
-  binding: winsdk/winrt are archived and no longer ship wheels for recent
-  Python versions, while .NET has first-party, actively maintained WinRT
-  support. Python itself never speaks COM/WinRT here -- it just launches the
-  .exe as a subprocess and reads its JSON/cover output files.
-  If NowPlayingBridge.exe hasn't been built yet, falls back to a plain
-  window-title heuristic over known player processes
+- Windows (primary): starts NowPlayingBridge.ps1, a small PowerShell script
+  (see src/NowPlayingBridge.ps1) that talks to the Windows Media Control APIs
+  (SMTC, WinRT) -- the same source behind the Windows volume flyout preview.
+  Reason for going through PowerShell instead of a Python WinRT binding:
+  winsdk/winrt are archived and no longer ship wheels for recent Python
+  versions. PowerShell, unlike a Python binding, needs NO install or build
+  step at all -- it ships with every Windows install and has built-in support
+  for loading WinRT types. Python itself never speaks COM/WinRT here -- it
+  just launches the script as a subprocess and reads its JSON/cover output
+  files.
+  If NowPlayingBridge.ps1 is missing, or PowerShell itself isn't available,
+  falls back to a plain window-title heuristic over known player processes
   (parameters.KNOWN_PLAYER_PROCESSES, e.g. "Artist - Title" for Spotify) --
   title/artist only, no cover.
 - Linux: queries MPRIS (the freedesktop.org media-player D-Bus standard) via
@@ -63,7 +65,7 @@ Threading model:
   calls AudioAnalyzer._audio_callback directly from its own native audio
   thread whenever a block is ready.
 - Now-playing lookup runs in its own daemon thread (NowPlayingReader._loop),
-  which either polls NowPlayingBridge.exe's output files, scans window
+  which either polls NowPlayingBridge.ps1's output files, scans window
   titles, or queries MPRIS, depending on platform/availability.
 - Results are never pushed into Tkinter directly; they go through callbacks,
   and MusicModeWindow marshals them back onto the GUI thread via
@@ -406,11 +408,12 @@ def _load_art_bytes(art_url: str):
 class NowPlayingReader:
     """Provides title/artist/cover art of the currently playing track.
 
-    Windows (primary): starts NowPlayingBridge.exe as a background process
-    and polls its JSON/cover output files -- provides title, artist AND cover
-    art (the same source behind the Windows volume flyout preview).
-    Windows (fallback, if parameters.NOWPLAYING_BRIDGE_EXE hasn't been built
-    yet): plain window-title heuristic over known media player processes
+    Windows (primary): starts NowPlayingBridge.ps1 (a PowerShell script, no
+    install/build step needed) as a background process and polls its
+    JSON/cover output files -- provides title, artist AND cover art (the same
+    source behind the Windows volume flyout preview).
+    Windows (fallback, if PowerShell itself isn't available for some reason):
+    plain window-title heuristic over known media player processes
     (parameters.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for Spotify --
     title/artist only, no cover. Stays inactive without pywin32.
 
@@ -425,7 +428,7 @@ class NowPlayingReader:
         self._thread = None
         self._process = None
         self._last_signature = None
-        self._use_bridge = _IS_WINDOWS and parameters.NOWPLAYING_BRIDGE_EXE.exists()
+        self._use_bridge = _IS_WINDOWS and parameters.NOWPLAYING_BRIDGE_SCRIPT.exists()
         self._use_mpris = not _IS_WINDOWS and _DBUS_AVAILABLE
 
     def start(self) -> None:
@@ -453,12 +456,14 @@ class NowPlayingReader:
         cache_dir.mkdir(exist_ok=True)
         try:
             self._process = subprocess.Popen(
-                [str(parameters.NOWPLAYING_BRIDGE_EXE), str(cache_dir), str(int(self.poll_interval * 1000))],
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
+                 str(cache_dir), str(int(self.poll_interval * 1000))],
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except Exception:
-            logging.exception("Failed to start NowPlayingBridge.exe")
+            logging.exception("Failed to start NowPlayingBridge.ps1")
             self._process = None
             self._use_bridge = False
 
@@ -613,7 +618,7 @@ class MusicModeWindow(tk.Toplevel):
                                       wraplength=size + 20, justify="center")
         self.track_label.pack(pady=(5, 0))
 
-        have_now_playing_source = parameters.NOWPLAYING_BRIDGE_EXE.exists() or _WIN32_AVAILABLE or _DBUS_AVAILABLE
+        have_now_playing_source = parameters.NOWPLAYING_BRIDGE_SCRIPT.exists() or _WIN32_AVAILABLE or _DBUS_AVAILABLE
         if not have_now_playing_source:
             self.track_label.config(text="(no title source available)")
         else:

@@ -29,8 +29,7 @@ DMX-RDC/
     ├── controller.py             # DMX serial link, preset persistence, platform helpers
     ├── musicmode.py               # audio analysis + Music Mode window
     ├── ui.py                     # main window, theme, dialogs
-    ├── NowPlayingBridge.csproj   # Windows-only helper (see Music Mode below)
-    └── Program.cs
+    └── NowPlayingBridge.ps1      # Windows-only helper (see Music Mode below)
 ```
 
 ## Requirements
@@ -59,16 +58,9 @@ cd DMX-RDC # or the folder you selected
 pip install -r requirements.txt
 ```
 
-### Optional: enabling cover art on Windows
+### Cover art on Windows
 
-Track title/artist work out of the box. Cover art additionally needs a small bundled C#/.NET helper (`NowPlayingBridge`) that talks to Windows' own media APIs — the same source behind the volume flyout preview. It's optional and built once:
-
-```bash
-cd src
-dotnet publish -c Release -r win-x64 --self-contained false -o out
-```
-
-Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download). Without this step, Music Mode still shows title/artist (via a window-title fallback) — just no cover art.
+Track title/artist work out of the box (Music Mode launches `src/NowPlayingBridge.ps1`, a small PowerShell script that talks to Windows' own media APIs — the same source behind the volume flyout preview). Nothing to install: PowerShell and the required Windows APIs ship with every Windows install, so this runs automatically the first time you open Music Mode.
 
 ## Usage
 
@@ -90,7 +82,7 @@ Click **🎵 Music Mode** to open it. It analyzes whatever is currently playing 
 - **Spectrum** and **Waveform**: a live view of the audio, side by side.
 - **Channel Mapping**: assign any of Bass / Mid / Treble / Beat / Pitch to any DMX channel. Beat is a short pulse on sudden loudness spikes (good for strobes); Pitch reflects how bright/dark the sound currently is (better suited to continuous rotation/speed than a plain band).
 - **Sensitivity** / **Smoothing**: tune how strongly and how quickly the fixture reacts.
-- **Now Playing**: shows the title/artist of the current track, with cover art where available (see [Optional: enabling cover art](#optional-enabling-cover-art-on-windows) on Windows). Without cover art, the disc shows a small rotating pixel-art animation instead.
+- **Now Playing**: shows the title/artist of the current track, with cover art where available (see [Cover art on Windows](#cover-art-on-windows)). Without cover art, the disc shows a small rotating pixel-art animation instead.
 
 Mappings can be changed while Music Mode is running.
 
@@ -124,7 +116,8 @@ Each preset is a plain JSON file: `presets/<name>.json`:
 - Tested on Windows with a generic USB-DMX (FTDI-based) adapter. That's the primary, fully-tested platform.
 - **Linux support is groundwork, not verified**: the code paths exist (PulseAudio/PipeWire loopback capture, MPRIS-based title/artist/cover via `jeepney`) but haven't been tested against a real PulseAudio/PipeWire/D-Bus setup. If audio capture or Now Playing don't pick anything up, check `pactl list sources short` for your monitor source name, and `busctl --user list | grep mpris` for an active MPRIS player — `src/musicmode.py`'s `_resolve_loopback_device` and `_fetch_mpris_metadata` are the places to adjust if the exact names/shapes differ on your system.
 - macOS is untested and currently unsupported for Music Mode (no loopback backend implemented); the rest of the app should still work.
-- Cover art on Windows depends on the app you're playing from registering with Windows' media session API (most modern players do) and on `NowPlayingBridge.exe` having been built (see Installation) — without it, you still get title/artist via a window-title fallback, just for a smaller, hardcoded list of known player processes (`KNOWN_PLAYER_PROCESSES` in `src/config.py`).
+- Cover art on Windows depends on the app you're playing from registering with Windows' media session API (most modern players do) and on PowerShell being available on your system (it is, on every normal Windows install) — if `NowPlayingBridge.ps1` can't run for some reason, you still get title/artist via a window-title fallback, just for a smaller, hardcoded list of known player processes (`KNOWN_PLAYER_PROCESSES` in `src/config.py`).
+- `NowPlayingBridge.ps1` itself is based on a known public PowerShell/WinRT interop pattern for calling `Windows.Media.Control` without a compiled binding, but wasn't run against a live Windows media session while writing it. If it doesn't pick up your player, try running it directly (`powershell -File src/NowPlayingBridge.ps1 .`) to see any errors instead of them disappearing into the background process.
 
 ## License
 

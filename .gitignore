@@ -1,14 +1,14 @@
-# Python (Build-Artefakte, kein __pycache__)
+# Python build artifacts (not __pycache__, see project decision)
 *.egg-info/
 build/
 dist/
 
-# Virtuelle Umgebungen
+# Virtual environments
 .venv/
 venv/
 env/
 
-# Editoren/IDEs
+# Editors/IDEs
 .vscode/
 .idea/
 
@@ -16,10 +16,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# .NET-Build-Artefakte der NowPlayingBridge (src/NowPlayingBridge.csproj)
-src/bin/
-src/obj/
-src/out/
-
-# Laufzeit-Cache von NowPlayingBridge.exe (Titel/Cover-Zwischenspeicher)
+# Runtime cache of NowPlayingBridge.ps1 (title/cover cache)
 nowplaying_cache/
