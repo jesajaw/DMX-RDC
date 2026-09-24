@@ -63,6 +63,9 @@ class parameters:
     # Linux (see NowPlayingReader).
     NOWPLAYING_BRIDGE_SCRIPT = Path(__file__).resolve().parent / "NowPlayingBridge.ps1"
     NOWPLAYING_CACHE_DIR = Path(__file__).resolve().parent.parent / "nowplaying_cache"
+    # TEMP while debugging cover art: set to False once NowPlayingBridge.ps1
+    # reliably works, so nowplaying.json stays small in normal use.
+    NOWPLAYING_DEBUG = True
 
     # Known media player processes whose window title is searched for "Artist -
     # Title" (Windows fallback, used only if NowPlayingBridge.ps1 is missing

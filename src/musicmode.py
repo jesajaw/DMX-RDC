@@ -411,9 +411,16 @@ class NowPlayingReader:
     Windows (primary): starts NowPlayingBridge.ps1 (a PowerShell script, no
     install/build step needed) as a background process and polls its
     JSON/cover output files -- provides title, artist AND cover art (the same
-    source behind the Windows volume flyout preview).
-    Windows (fallback, if PowerShell itself isn't available for some reason):
-    plain window-title heuristic over known media player processes
+    source behind the Windows volume flyout preview). Its own stdout/stderr
+    go into nowplaying_cache/bridge.log for diagnosis. If it doesn't produce
+    any output within a few seconds (e.g. the WinRT interop pattern it uses
+    doesn't fully match on this system -- see its own docstring), this reader
+    automatically gives up on it and falls back to the window-title heuristic
+    below, so a broken bridge script degrades gracefully instead of silencing
+    everything.
+    Windows (fallback, used automatically if the above doesn't pan out, or if
+    NowPlayingBridge.ps1 is missing / PowerShell is unavailable): plain
+    window-title heuristic over known media player processes
     (parameters.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for Spotify --
     title/artist only, no cover. Stays inactive without pywin32.
 
@@ -421,13 +428,20 @@ class NowPlayingReader:
     art (as a file:// or http(s):// URL). Stays inactive without jeepney.
     """
 
+    # How many consecutive polls (roughly this many * poll_interval seconds)
+    # the bridge script gets to produce its first output file before this
+    # reader gives up on it and falls back to the window-title heuristic.
+    BRIDGE_MISS_LIMIT = 10
+
     def __init__(self, on_update, poll_interval: float = 1.0):
         self.on_update = on_update  # callback(title: str, artist: str, cover_bytes: bytes | None)
         self.poll_interval = poll_interval
         self._running = False
         self._thread = None
         self._process = None
+        self._log_file = None
         self._last_signature = None
+        self._bridge_miss_count = 0
         self._use_bridge = _IS_WINDOWS and parameters.NOWPLAYING_BRIDGE_SCRIPT.exists()
         self._use_mpris = not _IS_WINDOWS and _DBUS_AVAILABLE
 
@@ -450,17 +464,27 @@ class NowPlayingReader:
             except Exception:
                 pass
             self._process = None
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
 
     def _start_bridge_process(self) -> None:
         cache_dir = parameters.NOWPLAYING_CACHE_DIR
         cache_dir.mkdir(exist_ok=True)
         try:
+            self._log_file = open(cache_dir / "bridge.log", "w", encoding="utf-8")
+            args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
+                    str(cache_dir), str(int(self.poll_interval * 1000))]
+            if parameters.NOWPLAYING_DEBUG:
+                args.append("-IncludeDebugInfo")
             self._process = subprocess.Popen(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-IncludeDebugInfo",
-                 "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
-                 str(cache_dir), str(int(self.poll_interval * 1000))],
+                args,
                 creationflags=subprocess.CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=self._log_file, stderr=subprocess.STDOUT,
             )
         except Exception:
             logging.exception("Failed to start NowPlayingBridge.ps1")
@@ -486,7 +510,22 @@ class NowPlayingReader:
         try:
             data = json.loads((cache_dir / "nowplaying.json").read_text(encoding="utf-8"))
         except Exception:
+            self._bridge_miss_count += 1
+            if self._bridge_miss_count >= self.BRIDGE_MISS_LIMIT:
+                logging.warning(
+                    "NowPlayingBridge.ps1 produced no output after %d attempts -- "
+                    "falling back to the window-title heuristic. Check %s for errors.",
+                    self._bridge_miss_count, cache_dir / "bridge.log",
+                )
+                self._use_bridge = False
+                if self._process is not None:
+                    try:
+                        self._process.terminate()
+                    except Exception:
+                        pass
+                    self._process = None
             return
+        self._bridge_miss_count = 0
 
         title = data.get("title", "")
         artist = data.get("artist", "")

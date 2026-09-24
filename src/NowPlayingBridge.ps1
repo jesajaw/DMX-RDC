@@ -102,7 +102,12 @@ function Write-Result($Result) {
     # Set-Content can transiently fail with a sharing violation if another
     # process (Python reading it, or a second bridge instance) has the file
     # open at the exact same moment -- a short retry clears this up almost
-    # always, since these locks are typically held for microseconds.
+    # always, since these locks are typically held for microseconds. If it's
+    # NOT transient (e.g. a stray leftover process holding the file open
+    # indefinitely), silently give up on this write instead of throwing --
+    # this function can be called from inside catch blocks with no further
+    # error handling above them, so an unhandled exception here would kill
+    # the entire polling loop for good, not just skip one write.
     $maxAttempts = 5
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
@@ -111,7 +116,7 @@ function Write-Result($Result) {
         }
         catch {
             if ($attempt -eq $maxAttempts) {
-                throw
+                return
             }
             Start-Sleep -Milliseconds 50
         }
