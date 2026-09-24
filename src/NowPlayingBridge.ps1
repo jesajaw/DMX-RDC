@@ -24,11 +24,12 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
 [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
 [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
-[Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
 [Windows.Storage.Streams.IRandomAccessStreamWithContentType, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+[Windows.Storage.Streams.IBuffer, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+[Windows.Storage.Streams.Buffer, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
 
 # ---------------------------------------------------------------------------
-# WinRT async helper
+# WinRT async helpers
 # ---------------------------------------------------------------------------
 
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
@@ -39,6 +40,26 @@ $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-O
 
 function Await-WinRtTask($WinRtTask, [type]$ResultType) {
     $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    return $netTask.Result
+}
+
+# IInputStream.ReadAsync returns IAsyncOperationWithProgress<IBuffer, UInt32>,
+# a different generic shape than plain IAsyncOperation<T> -- needs its own
+# AsTask() overload. We deliberately ignore this helper's *return value* when
+# reading the thumbnail below: it comes back as an untyped System.__ComObject
+# just like everything else routed through reflection here, which is exactly
+# what breaks every later typed method/constructor call. Instead we read into
+# a buffer we constructed ourselves (see below), which stays properly typed.
+$asTaskProgressGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and
+    $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperationWithProgress`2'
+})[0]
+
+function Await-WinRtProgress($WinRtTask, [type]$ResultType, [type]$ProgressType) {
+    $asTask = $asTaskProgressGeneric.MakeGenericMethod($ResultType, $ProgressType)
     $netTask = $asTask.Invoke($null, @($WinRtTask))
     $netTask.Wait(-1) | Out-Null
     return $netTask.Result
@@ -282,33 +303,33 @@ while ($true) {
                             $size = [uint32]$streamSize
 
                             # ------------------------------------------------
-                            # Read via DataReader -- a concrete WinRT class,
-                            # so PowerShell can call its methods directly
-                            # (no interface reflection needed, unlike raw
-                            # IInputStream.ReadAsync on the stream itself,
-                            # which failed with a ComObject dispatch error --
-                            # DataReader wraps that complexity internally)
+                            # Convert the WinRT stream into a regular .NET
+                            # Stream via the interop bridge extension method,
+                            # then read it with completely ordinary .NET APIs
+                            # -- no further WinRT-specific interop (DataReader,
+                            # IInputStream reflection, etc.) needed, which is
+                            # where the previous attempts kept failing on an
+                            # untyped System.__ComObject.
                             # ------------------------------------------------
 
-                            $reader = [Windows.Storage.Streams.DataReader]::new($stream)
+                            $netStream = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($stream)
 
                             try {
-                                $loadTask = $reader.LoadAsync($size)
-                                $loaded = Await-WinRtTask $loadTask ([uint32])
-
-                                if ($loaded -eq 0) {
-                                    throw "DataReader.LoadAsync loaded 0 bytes."
+                                $memoryStream = New-Object System.IO.MemoryStream
+                                try {
+                                    $netStream.CopyTo($memoryStream)
+                                    $bytes = $memoryStream.ToArray()
                                 }
-
-                                $bytes = New-Object byte[] ([int]$loaded)
-                                $reader.ReadBytes($bytes)
+                                finally {
+                                    try { $memoryStream.Dispose() } catch { }
+                                }
                             }
                             finally {
-                                try { $reader.Dispose() } catch { }
+                                try { $netStream.Dispose() } catch { }
                             }
 
                             if ($null -eq $bytes -or $bytes.Length -eq 0) {
-                                throw "DataReader returned an empty buffer."
+                                throw "AsStreamForRead() returned an empty buffer."
                             }
 
                             # ------------------------------------------------
