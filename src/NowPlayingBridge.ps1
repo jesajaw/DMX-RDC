@@ -303,33 +303,39 @@ while ($true) {
                             $size = [uint32]$streamSize
 
                             # ------------------------------------------------
-                            # Convert the WinRT stream into a regular .NET
-                            # Stream via the interop bridge extension method,
-                            # then read it with completely ordinary .NET APIs
-                            # -- no further WinRT-specific interop (DataReader,
-                            # IInputStream reflection, etc.) needed, which is
-                            # where the previous attempts kept failing on an
-                            # untyped System.__ComObject.
+                            # Construct our own IBuffer (concrete class, via
+                            # ::new()) instead of trying to cast/convert
+                            # whatever ReadAsync() hands back -- objects we
+                            # construct ourselves keep their real .NET type;
+                            # objects returned through our reflection-based
+                            # Await helpers keep coming back as untyped
+                            # System.__ComObject, which is what broke every
+                            # previous attempt (DataReader ctor, IInputStream
+                            # cast, AsStreamForRead) at this exact spot.
                             # ------------------------------------------------
 
-                            $netStream = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($stream)
+                            $buffer = [Windows.Storage.Streams.Buffer]::new($size)
 
-                            try {
-                                $memoryStream = New-Object System.IO.MemoryStream
-                                try {
-                                    $netStream.CopyTo($memoryStream)
-                                    $bytes = $memoryStream.ToArray()
-                                }
-                                finally {
-                                    try { $memoryStream.Dispose() } catch { }
-                                }
-                            }
-                            finally {
-                                try { $netStream.Dispose() } catch { }
-                            }
+                            # Call ReadAsync directly via dot-syntax on $stream
+                            # -- the same kind of dynamic COM dispatch that
+                            # already works fine for $stream.Size/$thumb.OpenReadAsync()
+                            # elsewhere in this script. Reads bytes INTO our
+                            # own $buffer in place, so its *return value* (which
+                            # would again be an untyped ComObject) is ignored.
+                            $readTask = $stream.ReadAsync(
+                                $buffer,
+                                $size,
+                                [Windows.Storage.Streams.InputStreamOptions]::None
+                            )
+                            Await-WinRtProgress $readTask ([Windows.Storage.Streams.IBuffer]) ([uint32]) | Out-Null
+
+                            # $buffer is still OUR properly-typed variable, so
+                            # this conversion (unlike all the earlier ones) has
+                            # a real .NET type to work with.
+                            $bytes = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]::ToArray($buffer)
 
                             if ($null -eq $bytes -or $bytes.Length -eq 0) {
-                                throw "AsStreamForRead() returned an empty buffer."
+                                throw "ReadAsync produced an empty buffer."
                             }
 
                             # ------------------------------------------------
