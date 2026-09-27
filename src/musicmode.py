@@ -34,21 +34,28 @@ Platform notes:
 - macOS: neither path applies; AudioAnalyzer.start() reports an error via
   on_frame(AudioFrame(error=...)), the rest of the UI stays usable.
 
-Title/artist/cover art:
-- Windows (primary): starts NowPlayingBridge.ps1, a small PowerShell script
-  (see src/NowPlayingBridge.ps1) that talks to the Windows Media Control APIs
-  (SMTC, WinRT) -- the same source behind the Windows volume flyout preview.
-  Reason for going through PowerShell instead of a Python WinRT binding:
-  winsdk/winrt are archived and no longer ship wheels for recent Python
-  versions. PowerShell, unlike a Python binding, needs NO install or build
-  step at all -- it ships with every Windows install and has built-in support
-  for loading WinRT types. Python itself never speaks COM/WinRT here -- it
-  just launches the script as a subprocess and reads its JSON/cover output
-  files.
-  If NowPlayingBridge.ps1 is missing, or PowerShell itself isn't available,
-  falls back to a plain window-title heuristic over known player processes
-  (parameters.KNOWN_PLAYER_PROCESSES, e.g. "Artist - Title" for Spotify) --
-  title/artist only, no cover.
+Title/artist/album/cover art:
+- Windows, tried in priority order:
+  1. NowPlayingBridge.exe (see src/Program.cs), if it's been built. Compiled
+     C# with real compiler-level WinRT/await support -- provides title,
+     artist, album AND cover art (the same source behind the Windows volume
+     flyout preview). Needs a one-time .NET SDK build step (see README).
+  2. NowPlayingBridge.ps1 (see src/NowPlayingBridge.ps1), a small PowerShell
+     script that needs NO install/build step -- ships with every Windows
+     install and has built-in support for loading WinRT types. Provides
+     title, artist and album, but deliberately no cover art: reading a WinRT
+     stream's raw bytes via PowerShell's late-bound COM dispatch turned out
+     to be unreliable in practice (see that script's own docstring for the
+     full story -- several different workarounds were tried and each hit a
+     different symptom of the same underlying type-erasure problem).
+  3. A plain window-title heuristic over known player processes
+     (parameters.KNOWN_PLAYER_PROCESSES, e.g. "Artist - Title" for Spotify)
+     -- title/artist only, no album, no cover.
+  Python itself never speaks COM/WinRT for any of this -- it just launches
+  whichever bridge is available as a subprocess and reads its JSON/cover
+  output files, or (for option 3) reads window titles via pywin32. If a
+  bridge (1 or 2) doesn't produce output within a few seconds, NowPlayingReader
+  automatically falls back further down this list.
 - Linux: queries MPRIS (the freedesktop.org media-player D-Bus standard) via
   `jeepney`, a pure-Python D-Bus library. Most Linux media players (browsers,
   VLC, Spotify, most desktop players) implement MPRIS, so this tends to have
@@ -406,31 +413,32 @@ def _load_art_bytes(art_url: str):
 
 
 class NowPlayingReader:
-    """Provides title/artist/cover art of the currently playing track.
+    """Provides title/artist/album/cover art of the currently playing track.
 
-    Windows (primary): starts NowPlayingBridge.ps1 (a PowerShell script, no
-    install/build step needed) as a background process and polls its
-    JSON/cover output files -- provides title, artist AND cover art (the same
-    source behind the Windows volume flyout preview). Its own stdout/stderr
-    go into nowplaying_cache/bridge.log for diagnosis. If it doesn't produce
-    any output within a few seconds (e.g. the WinRT interop pattern it uses
-    doesn't fully match on this system -- see its own docstring), this reader
-    automatically gives up on it and falls back to the window-title heuristic
-    below, so a broken bridge script degrades gracefully instead of silencing
-    everything.
-    Windows (fallback, used automatically if the above doesn't pan out, or if
-    NowPlayingBridge.ps1 is missing / PowerShell is unavailable): plain
-    window-title heuristic over known media player processes
-    (parameters.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for Spotify --
-    title/artist only, no cover. Stays inactive without pywin32.
+    Windows, tried in priority order:
+      1. NowPlayingBridge.exe (compiled C#, see src/Program.cs) if it has been
+         built -- title, artist, album AND cover art (the same source behind
+         the Windows volume flyout preview). Real compiler-level WinRT/await
+         support, so this is the most reliable option.
+      2. NowPlayingBridge.ps1 (plain PowerShell, ships as-is, no install/build
+         step) -- title, artist, album, but deliberately no cover art (see the
+         script's own docstring for why).
+      3. Plain window-title heuristic over known media player processes
+         (parameters.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for
+         Spotify -- title/artist only, no album, no cover. Stays inactive
+         without pywin32.
+    If a bridge (1 or 2) doesn't produce any output within a few seconds,
+    this reader gives up on it and falls back further down the list, so a
+    broken/missing bridge degrades gracefully instead of silencing everything.
+    Its stdout/stderr go into nowplaying_cache/bridge.log for diagnosis.
 
     Linux: queries MPRIS over D-Bus via `jeepney` -- title, artist and cover
     art (as a file:// or http(s):// URL). Stays inactive without jeepney.
     """
 
     # How many consecutive polls (roughly this many * poll_interval seconds)
-    # the bridge script gets to produce its first output file before this
-    # reader gives up on it and falls back to the window-title heuristic.
+    # a bridge gets to produce its first output file before this reader gives
+    # up on it and falls back further down the priority list.
     BRIDGE_MISS_LIMIT = 10
 
     def __init__(self, on_update, poll_interval: float = 1.0):
@@ -442,16 +450,22 @@ class NowPlayingReader:
         self._log_file = None
         self._last_signature = None
         self._bridge_miss_count = 0
-        self._use_bridge = _IS_WINDOWS and parameters.NOWPLAYING_BRIDGE_SCRIPT.exists()
+
+        self._bridge_kind = None  # "exe" | "ps1" | None
+        if _IS_WINDOWS:
+            if parameters.NOWPLAYING_BRIDGE_EXE.exists():
+                self._bridge_kind = "exe"
+            elif parameters.NOWPLAYING_BRIDGE_SCRIPT.exists():
+                self._bridge_kind = "ps1"
         self._use_mpris = not _IS_WINDOWS and _DBUS_AVAILABLE
 
     def start(self) -> None:
         if self._running:
             return
-        if not (self._use_bridge or self._use_mpris or _WIN32_AVAILABLE):
+        if not (self._bridge_kind or self._use_mpris or _WIN32_AVAILABLE):
             return
         self._running = True
-        if self._use_bridge:
+        if self._bridge_kind:
             self._start_bridge_process()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -476,24 +490,26 @@ class NowPlayingReader:
         cache_dir.mkdir(exist_ok=True)
         try:
             self._log_file = open(cache_dir / "bridge.log", "w", encoding="utf-8")
-            args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
-                    str(cache_dir), str(int(self.poll_interval * 1000))]
-            if parameters.NOWPLAYING_DEBUG:
-                args.append("-IncludeDebugInfo")
+            if self._bridge_kind == "exe":
+                args = [str(parameters.NOWPLAYING_BRIDGE_EXE),
+                        str(cache_dir), str(int(self.poll_interval * 1000))]
+            else:  # "ps1"
+                args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
+                        str(cache_dir), str(int(self.poll_interval * 1000))]
             self._process = subprocess.Popen(
                 args,
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 stdout=self._log_file, stderr=subprocess.STDOUT,
             )
         except Exception:
-            logging.exception("Failed to start NowPlayingBridge.ps1")
+            logging.exception("Failed to start NowPlayingBridge (%s)", self._bridge_kind)
             self._process = None
-            self._use_bridge = False
+            self._bridge_kind = None
 
     def _loop(self) -> None:
         while self._running:
-            if self._use_bridge:
+            if self._bridge_kind:
                 self._poll_bridge_files()
             elif self._use_mpris:
                 self._poll_mpris()
@@ -513,11 +529,11 @@ class NowPlayingReader:
             self._bridge_miss_count += 1
             if self._bridge_miss_count >= self.BRIDGE_MISS_LIMIT:
                 logging.warning(
-                    "NowPlayingBridge.ps1 produced no output after %d attempts -- "
-                    "falling back to the window-title heuristic. Check %s for errors.",
-                    self._bridge_miss_count, cache_dir / "bridge.log",
+                    "NowPlayingBridge (%s) produced no output after %d attempts -- "
+                    "falling back further. Check %s for errors.",
+                    self._bridge_kind, self._bridge_miss_count, cache_dir / "bridge.log",
                 )
-                self._use_bridge = False
+                self._bridge_kind = None
                 if self._process is not None:
                     try:
                         self._process.terminate()
@@ -657,7 +673,9 @@ class MusicModeWindow(tk.Toplevel):
                                       wraplength=size + 20, justify="center")
         self.track_label.pack(pady=(5, 0))
 
-        have_now_playing_source = parameters.NOWPLAYING_BRIDGE_SCRIPT.exists() or _WIN32_AVAILABLE or _DBUS_AVAILABLE
+        have_now_playing_source = (parameters.NOWPLAYING_BRIDGE_EXE.exists()
+                                    or parameters.NOWPLAYING_BRIDGE_SCRIPT.exists()
+                                    or _WIN32_AVAILABLE or _DBUS_AVAILABLE)
         if not have_now_playing_source:
             self.track_label.config(text="(no title source available)")
         else:

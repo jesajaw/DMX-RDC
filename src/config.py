@@ -54,22 +54,26 @@ class parameters:
     SPIN_STEP_DEG = 6
     SPIN_INTERVAL_MS = 80
 
-    # NowPlayingBridge: small PowerShell background script that provides title/
-    # artist/cover on Windows via WinRT (Windows.Media.Control, see
-    # src/NowPlayingBridge.ps1). Needs no install/build step -- PowerShell and
-    # Windows.Media.Control are part of every Windows install. If the script
-    # is missing entirely, or PowerShell itself is unavailable, NowPlayingReader
-    # falls back to a plain window-title heuristic on Windows. Not used on
-    # Linux (see NowPlayingReader).
+    # NowPlayingBridge: two possible sources for title/artist/album/cover on
+    # Windows, tried in priority order by NowPlayingReader:
+    #  1. NOWPLAYING_BRIDGE_EXE (src/Program.cs, .NET SDK build): compiled C#,
+    #     real compiler-level WinRT/await support -- can also read cover art
+    #     reliably. Optional, one-time build step (see README).
+    #  2. NOWPLAYING_BRIDGE_SCRIPT (src/NowPlayingBridge.ps1): plain
+    #     PowerShell, ships as-is, no install/build step -- title/artist/album
+    #     only. Deliberately does NOT attempt cover art: reading a WinRT
+    #     stream's bytes via PowerShell's late-bound COM dispatch turned out
+    #     to be unreliable in practice (see the script's own docstring).
+    #  3. If neither is usable, NowPlayingReader falls back further to a
+    #     plain window-title heuristic on Windows (title/artist only). Not
+    #     used on Linux (see NowPlayingReader).
+    NOWPLAYING_BRIDGE_EXE = Path(__file__).resolve().parent / "out" / "NowPlayingBridge.exe"
     NOWPLAYING_BRIDGE_SCRIPT = Path(__file__).resolve().parent / "NowPlayingBridge.ps1"
     NOWPLAYING_CACHE_DIR = Path(__file__).resolve().parent.parent / "nowplaying_cache"
-    # TEMP while debugging cover art: set to False once NowPlayingBridge.ps1
-    # reliably works, so nowplaying.json stays small in normal use.
-    NOWPLAYING_DEBUG = True
 
     # Known media player processes whose window title is searched for "Artist -
-    # Title" (Windows fallback, used only if NowPlayingBridge.ps1 is missing
-    # or PowerShell is unavailable). Extend as needed.
+    # Title" (Windows fallback, used only if neither bridge above is usable).
+    # Extend as needed.
     KNOWN_PLAYER_PROCESSES = {
         "spotify.exe", "vlc.exe", "foobar2000.exe", "wmplayer.exe",
         "musicbee.exe", "itunes.exe", "winamp.exe", "aimp.exe",
