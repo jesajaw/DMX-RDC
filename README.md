@@ -1,79 +1,66 @@
 # DMX Derby Controller
 
-A small UI to control a DMX derby/laser fixture over a USB-DMX adapter — one slider per channel, live plain-text readout of what each value actually does, Blackout and a full Music Mode.
+A small UI to control a DMX derby/laser fixture over a USB-DMX adapter — one slider per channel, live plain-text readout of what each value actually does, Blackout and a Music Mode.
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+## 🚀 Features
 
-## Features
-
-- One slider per DMX channel (9-channel mode), each showing a description of the current value (e.g. `114 | Derby + Laser`) instead of a raw number.
-- Non-blocking connect, detects connection loss (e.g. adapter unplugged)
-- One-click blackout
-- Three selectable color themes (purple / blue / black-white) via `COLOR_SCHEME` in `src/config.py`
-- **Music Mode**: analyzes your system's audio in real time and drives the fixture from it
+* One slider per DMX channel (9-channel mode), each showing a description of the current value
+* Blackout
+* Three selectable color themes via `COLOR_SCHEME` in `src/config.py`
+* **Music Mode**: analyzes your system's audio in real time and drives the fixture from it
   - Live spectrum + waveform display
   - Bass / Mid / Treble / Beat / Pitch, each mappable to any DMX channel
   - Adjustable sensitivity and smoothing
-  - Shows the currently playing track's title, artist, and (where available) cover art
+  - Shows the currently playing track's title, artist, and cover art
 
-## Project layout
+## 📁 Project layout
 
 ```
 DMX-RDC/
-├── main.py                       # entry point — run this
+├── main.py # entry point — run this
 ├── requirements.txt
-├── presets/                      # created automatically, holds saved channel presets
+├── presets/    # created automatically, holds saved channel presets
 └── src/
-    ├── config.py                 # all constants live here (parameters class)
-    ├── controller.py             # DMX serial link, preset persistence, platform helpers
-    ├── musicmode.py               # audio analysis + Music Mode window
-    ├── ui.py                     # main window, theme, dialogs
-    ├── NowPlayingBridge.ps1      # Windows: title/artist/album, no install needed
-    ├── NowPlayingBridge.csproj   # Windows: optional, adds cover art (needs .NET SDK build)
-    └── Program.cs
+    ├── config.py   # all constants live here
+    ├── controller.py   # DMX serial link, preset persistence, platform helpers
+    ├── musicmode.py    # audio analysis + Music Mode window
+    ├── ui.py   # main window, theme, dialogs
+    └── NowPlayingBridge.ps1    # Windows: title/artist/album/cover bridge
 ```
 
-## Requirements
 
-- Python 3.10+
-- A USB-DMX adapter that is recognized as a serial (COM) port
-- See [requirements.txt](requirements.txt) for Python packages — installation differs slightly by platform, see below
+## 🛠️ Requirements
 
-**Windows** (primary, fully supported):
+* Cross-platform:
+  * Python 3.10+
+  * pyserial 3.5+
+  * numpy 1.26+
+  * pillow 10.0+
+* Windows only:
+  * PyAudioWPatch>=0.2.12
+  * pywin32>=306
+  * PyAudio>=0.2.14
+* Linux only (not tested yet):
+  * jeepney>=0.8.0
+
+* A USB-DMX adapter that is recognized as a serial (COM) port
+* See [requirements.txt](requirements.txt) for Python packages — installation differs slightly by platform, see below
+
+
+**Windows**:
 ```bash
 pip install -r requirements.txt
 ```
-This installs `PyAudioWPatch` (WASAPI loopback audio capture) and `pywin32` (optional fallback for track title/artist).
+
 
 **Linux** (groundwork/experimental — see [Limitations](#limitations)):
 ```bash
 pip install -r requirements.txt
 ```
+
 `requirements.txt` uses platform markers, so on Linux this instead installs plain `PyAudio` (needs PortAudio; on Debian/Ubuntu: `sudo apt install portaudio19-dev` first) and `jeepney` for MPRIS-based title/artist/cover. Loopback capture uses your PulseAudio/PipeWire "Monitor of ..." source, which must exist and be running.
 
-## Installation
-
-```bash
-git clone https://github.com/jesajaw/DMX-RDC
-cd DMX-RDC # or the folder you selected
-pip install -r requirements.txt
-```
-
-### Title, artist, album & cover art on Windows
-
-Music Mode launches `src/NowPlayingBridge.ps1`, a small PowerShell script that talks to Windows' own media APIs (SMTC — the same source behind the volume flyout preview), automatically the first time you open it. Nothing to install: PowerShell and the required Windows APIs ship with every Windows install. This gets you title, artist and album — but deliberately **not** cover art (reading a WinRT stream's bytes via PowerShell's COM interop turned out to be unreliable; see the script's own docstring for the full story).
-
-For cover art too, build the optional compiled helper once (needs the [.NET 8 SDK](https://dotnet.microsoft.com/download)):
-
-```bash
-cd src
-dotnet publish -c Release -r win-x64 --self-contained false -o out
-```
-
-Music Mode automatically prefers `src/out/NowPlayingBridge.exe` over the PowerShell script once it exists — no other setup needed.
-
-## Usage
+## 💻 Usage
 
 ```bash
 python main.py
@@ -86,9 +73,9 @@ python main.py
 5. **🎵 Music Mode** opens a dedicated window for audio-reactive lighting (see below). The main window hides itself while Music Mode is open but keeps sending in the background; closing Music Mode brings it back.
 6. **Disconnect** stops sending and closes the port.
 
-## Music Mode
+### Music Mode
 
-Click **🎵 Music Mode** to open it. It analyzes whatever is currently playing through your system's audio output (any app — Spotify, a browser tab, a game, anything) and turns that into DMX values.
+Click **🎵 Music Mode** to open it. It analyzes whatever is currently playing through your system's audio output and turns that into DMX values.
 
 - **Spectrum** and **Waveform**: a live view of the audio, side by side.
 - **Channel Mapping**: assign any of Bass / Mid / Treble / Beat / Pitch to any DMX channel. Beat is a short pulse on sudden loudness spikes (good for strobes); Pitch reflects how bright/dark the sound currently is (better suited to continuous rotation/speed than a plain band).
@@ -97,7 +84,7 @@ Click **🎵 Music Mode** to open it. It analyzes whatever is currently playing 
 
 Mappings can be changed while Music Mode is running.
 
-## Presets
+### Presets
 
 Channel setups can be saved and reloaded as presets, stored as individual JSON files in the `presets/` folder (created automatically on first run).
 
@@ -130,6 +117,6 @@ Each preset is a plain JSON file: `presets/<name>.json`:
 - Cover art on Windows needs the optional compiled `NowPlayingBridge.exe` (see above) — without it, you still get title/artist/album via the PowerShell script, just no cover, and if that script can't run either, a window-title fallback for a smaller, hardcoded list of known player processes (`KNOWN_PLAYER_PROCESSES` in `src/config.py`).
 - `NowPlayingBridge.ps1` deliberately does not attempt cover art after multiple PowerShell/WinRT interop workarounds (DataReader, `AsStreamForRead`, a self-constructed `IBuffer`) all hit variants of the same underlying problem: PowerShell's late-bound COM objects only reliably dispatch directly-declared interface members, not inherited ones like `IInputStream.ReadAsync`. `NowPlayingBridge.exe` (compiled C#, real WinRT/await support) doesn't have this limitation.
 
-## License
+## 📜 License
 
-MIT — see [LICENSE](LICENSE).
+Distributed under the MIT License. See [LICENSE](LICENSE) for more information.

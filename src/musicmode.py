@@ -49,7 +49,7 @@ Title/artist/album/cover art:
      full story -- several different workarounds were tried and each hit a
      different symptom of the same underlying type-erasure problem).
   3. A plain window-title heuristic over known player processes
-     (parameters.KNOWN_PLAYER_PROCESSES, e.g. "Artist - Title" for Spotify)
+     (config.KNOWN_PLAYER_PROCESSES, e.g. "Artist - Title" for Spotify)
      -- title/artist only, no album, no cover.
   Python itself never speaks COM/WinRT for any of this -- it just launches
   whichever bridge is available as a subprocess and reads its JSON/cover
@@ -96,7 +96,8 @@ from tkinter import ttk
 
 import numpy as np
 
-from .config import parameters
+from . import config
+
 from .controller import apply_dark_titlebar
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -169,14 +170,14 @@ class AudioAnalyzer:
     needed here.
     """
 
-    def __init__(self, on_frame, blocksize: int = parameters.BLOCK_SIZE,
-                 gain: float = 1.0, smoothing: float = 0.6, n_bars: int = parameters.N_BARS):
+    def __init__(self, on_frame, blocksize: int = config.BLOCK_SIZE,
+                 gain: float = 1.0, smoothing: float = 0.6, n_bars: int = config.N_BARS):
         self.on_frame = on_frame            # callback(frame: AudioFrame)
         self.blocksize = blocksize
         self.gain = gain                    # sensitivity, adjustable live (>1 boosts quiet parts, <1 suppresses them)
         self.smoothing = smoothing          # 0..~0.95, higher = slower fall-off (rises are always instant)
         self.n_bars = n_bars
-        self.samplerate = parameters.SAMPLE_RATE  # placeholder, replaced in start() by the real device
+        self.samplerate = config.SAMPLE_RATE  # placeholder, replaced in start() by the real device
         self._channels = 2                  # placeholder, replaced in start() by the real device
 
         self._running = False
@@ -184,14 +185,14 @@ class AudioAnalyzer:
         self._stream = None
         self._levels = {"bass": 0.0, "mid": 0.0, "treble": 0.0}
         self._bar_levels = np.zeros(n_bars)
-        self._bar_edges = np.geomspace(parameters.BAR_FREQ_RANGE[0], parameters.BAR_FREQ_RANGE[1], n_bars + 1)
-        self._energy_history = deque(maxlen=parameters.ENERGY_HISTORY_LEN)
+        self._bar_edges = np.geomspace(config.BAR_FREQ_RANGE[0], config.BAR_FREQ_RANGE[1], n_bars + 1)
+        self._energy_history = deque(maxlen=config.ENERGY_HISTORY_LEN)
         self._beat_level = 0.0
         self._beat_cooldown = 0
         self._pitch_level = 0.5
         self._pitch_lo = 0.4
         self._pitch_hi = 0.6
-        self._band_ref = {name: -120.0 for name in parameters.BAND_RANGES}  # loudest recent dB per band (auto-gain)
+        self._band_ref = {name: -120.0 for name in config.BAND_RANGES}  # loudest recent dB per band (auto-gain)
         self._bars_ref = -120.0
         self._layout_sr = None              # sample rate the FFT index tables below were built for
         self._buf = None
@@ -290,7 +291,7 @@ class AudioAnalyzer:
         sr = self.samplerate
         if self._layout_sr == sr:
             return
-        fft = parameters.FFT_SIZE
+        fft = config.FFT_SIZE
         self._window = np.hanning(fft)
         self._mag_scale = 2.0 / self._window.sum()   # a full-scale sine -> magnitude 1.0
         self._power_scale = 1.0 / (2.0 * 1.5)        # magnitude^2 -> mean-square power (Hann noise bandwidth = 1.5 bins)
@@ -302,12 +303,12 @@ class AudioAnalyzer:
                 ids = np.array([int(np.argmin(np.abs(freqs - (lo * hi) ** 0.5)))])
             return ids
 
-        self._band_idx = {name: bins(lo, hi) for name, (lo, hi) in parameters.BAND_RANGES.items()}
-        self._kick_idx = bins(*parameters.BEAT_BAND)
+        self._band_idx = {name: bins(lo, hi) for name, (lo, hi) in config.BAND_RANGES.items()}
+        self._kick_idx = bins(*config.BEAT_BAND)
         edges = self._bar_edges
         self._bar_idx = [bins(edges[i], edges[i + 1]) for i in range(self.n_bars)]
         centers = np.sqrt(edges[:-1] * edges[1:])
-        self._bar_tilt = parameters.SPECTRUM_TILT_DB_PER_OCT * np.log2(centers / 1000.0)
+        self._bar_tilt = config.SPECTRUM_TILT_DB_PER_OCT * np.log2(centers / 1000.0)
         self._bar_pos = np.arange(self.n_bars) / max(1, self.n_bars - 1)
         self._buf = np.zeros(fft, dtype=np.float32)
         self._layout_sr = sr
@@ -324,7 +325,7 @@ class AudioAnalyzer:
     def _process(self, samples: np.ndarray) -> None:
         self._ensure_layout()
         n = len(samples)
-        fft = parameters.FFT_SIZE
+        fft = config.FFT_SIZE
         if n >= fft:
             self._buf = samples[-fft:].astype(np.float32)
         else:
@@ -332,7 +333,7 @@ class AudioAnalyzer:
 
         mag = np.abs(np.fft.rfft(self._buf * self._window)) * self._mag_scale
         power = mag * mag * self._power_scale      # mean-square power per bin
-        decay = parameters.AGC_DECAY_DB_PER_S * n / self.samplerate
+        decay = config.AGC_DECAY_DB_PER_S * n / self.samplerate
         gamma = 1.0 / max(self.gain, 0.05)         # sensitivity: >1 lifts quiet parts, <1 suppresses them
 
         # --- bass/mid/treble: band RMS in dB, each band normalised to its own recent peak
@@ -340,15 +341,15 @@ class AudioAnalyzer:
             db = 10.0 * math.log10(float(power[idx].sum()) + 1e-12)
             ref = max(db, self._band_ref[name] - decay)
             self._band_ref[name] = ref
-            level = self._norm(db, max(ref, parameters.AGC_MIN_REF_BAND_DB), parameters.DB_RANGE_BAND) ** gamma
+            level = self._norm(db, max(ref, config.AGC_MIN_REF_BAND_DB), config.DB_RANGE_BAND) ** gamma
             self._levels[name] = self._fall(self._levels[name], level)
 
         # --- spectrum bars: one shared reference so the spectrum keeps its shape
         bar_db = np.array([10.0 * math.log10(float(power[idx].sum()) + 1e-12) for idx in self._bar_idx])
         bar_db = bar_db + self._bar_tilt
         self._bars_ref = max(float(bar_db.max()), self._bars_ref - decay)
-        top = max(self._bars_ref, parameters.AGC_MIN_REF_BARS_DB)
-        raw = np.clip((bar_db - (top - parameters.DB_RANGE_BARS)) / parameters.DB_RANGE_BARS, 0.0, 1.0)
+        top = max(self._bars_ref, config.AGC_MIN_REF_BARS_DB)
+        raw = np.clip((bar_db - (top - config.DB_RANGE_BARS)) / config.DB_RANGE_BARS, 0.0, 1.0)
         shown = raw ** gamma
         self._bar_levels = np.where(shown > self._bar_levels, shown,
                                     self.smoothing * self._bar_levels + (1 - self.smoothing) * shown)
@@ -360,13 +361,13 @@ class AudioAnalyzer:
         if self._beat_cooldown > 0:
             self._beat_cooldown -= 1
         onset = (self._beat_cooldown == 0 and avg > 0
-                 and kick > avg * parameters.BEAT_THRESHOLD_RATIO
-                 and kick > parameters.BEAT_MIN_RMS)
+                 and kick > avg * config.BEAT_THRESHOLD_RATIO
+                 and kick > config.BEAT_MIN_RMS)
         if onset:
             self._beat_level = 1.0
-            self._beat_cooldown = parameters.BEAT_COOLDOWN_BLOCKS
+            self._beat_cooldown = config.BEAT_COOLDOWN_BLOCKS
         else:
-            self._beat_level *= parameters.BEAT_DECAY
+            self._beat_level *= config.BEAT_DECAY
 
         # --- pitch: centroid over the log-spaced bars (0 = lowest bar, 1 = highest),
         # stretched to the range it recently used so it actually moves across 0..1
@@ -374,18 +375,18 @@ class AudioAnalyzer:
         total = float(weights.sum())
         if total > 1e-3:                            # silence -> hold the last value
             centroid = float((weights * self._bar_pos).sum() / total)
-            rate = parameters.PITCH_ADAPT_RATE
+            rate = config.PITCH_ADAPT_RATE
             self._pitch_lo = min(centroid, self._pitch_lo + rate)
             self._pitch_hi = max(centroid, self._pitch_hi - rate)
             lo, hi = self._pitch_lo, self._pitch_hi
-            if hi - lo < parameters.PITCH_SPAN_MIN:
+            if hi - lo < config.PITCH_SPAN_MIN:
                 mid = (lo + hi) / 2
-                lo, hi = mid - parameters.PITCH_SPAN_MIN / 2, mid + parameters.PITCH_SPAN_MIN / 2
+                lo, hi = mid - config.PITCH_SPAN_MIN / 2, mid + config.PITCH_SPAN_MIN / 2
             target = min(1.0, max(0.0, (centroid - lo) / (hi - lo)))
-            s = max(self.smoothing, parameters.PITCH_SMOOTHING_MIN)
+            s = max(self.smoothing, config.PITCH_SMOOTHING_MIN)
             self._pitch_level = s * self._pitch_level + (1 - s) * target
 
-        step = max(1, n // parameters.WAVE_POINTS)
+        step = max(1, n // config.WAVE_POINTS)
         waveform = np.clip(samples[::step], -1.0, 1.0)
 
         self.on_frame(AudioFrame(
@@ -412,7 +413,7 @@ def _get_process_name(pid: int) -> str:
 
 def _find_now_playing_title() -> str | None:
     """Scans visible top-level windows for one belonging to a known media
-    player process (parameters.KNOWN_PLAYER_PROCESSES) and returns its window
+    player process (config.KNOWN_PLAYER_PROCESSES) and returns its window
     title, or None."""
     found = []
 
@@ -426,7 +427,7 @@ def _find_now_playing_title() -> str | None:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
         except Exception:
             return
-        if _get_process_name(pid) in parameters.KNOWN_PLAYER_PROCESSES:
+        if _get_process_name(pid) in config.KNOWN_PLAYER_PROCESSES:
             found.append(title)
 
     try:
@@ -504,7 +505,7 @@ class NowPlayingReader:
       2. NowPlayingBridge.ps1 (plain PowerShell, ships as-is, no install/build
          step) -- title, artist, album, playing state and cover art.
       3. Plain window-title heuristic over known media player processes
-         (parameters.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for
+         (config.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for
          Spotify -- title/artist only, no album, no cover. Stays inactive
          without pywin32.
     If a bridge (1 or 2) doesn't produce any output within a few seconds,
@@ -535,9 +536,9 @@ class NowPlayingReader:
 
         self._bridge_kind = None  # "exe" | "ps1" | None
         if _IS_WINDOWS:
-            if parameters.NOWPLAYING_BRIDGE_EXE.exists():
+            if config.NOWPLAYING_BRIDGE_EXE.exists():
                 self._bridge_kind = "exe"
-            elif parameters.NOWPLAYING_BRIDGE_SCRIPT.exists():
+            elif config.NOWPLAYING_BRIDGE_SCRIPT.exists():
                 self._bridge_kind = "ps1"
         self._use_mpris = not _IS_WINDOWS and _DBUS_AVAILABLE
 
@@ -572,19 +573,19 @@ class NowPlayingReader:
             self._log_file = None
 
     def _start_bridge_process(self) -> None:
-        cache_dir = parameters.NOWPLAYING_CACHE_DIR
+        cache_dir = config.NOWPLAYING_CACHE_DIR
         cache_dir.mkdir(exist_ok=True)
         try:
             self._log_file = open(cache_dir / "bridge.log", "w", encoding="utf-8")
             if self._bridge_kind == "exe":
-                args = [str(parameters.NOWPLAYING_BRIDGE_EXE),
+                args = [str(config.NOWPLAYING_BRIDGE_EXE),
                         str(cache_dir), str(int(self.poll_interval * 1000))]
             else:  # "ps1"
                 args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                        "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
+                        "-File", str(config.NOWPLAYING_BRIDGE_SCRIPT),
                         str(cache_dir), str(int(self.poll_interval * 1000)),
                         str(os.getpid())]   # 3rd arg: bridge exits when this process is gone
-                if parameters.NOWPLAYING_DEBUG:
+                if config.NOWPLAYING_DEBUG:
                     args.append("-RunDebug")
             self._process = subprocess.Popen(
                 args,
@@ -611,7 +612,7 @@ class NowPlayingReader:
             time.sleep(self.poll_interval)
 
     def _poll_bridge_files(self) -> None:
-        cache_dir = parameters.NOWPLAYING_CACHE_DIR
+        cache_dir = config.NOWPLAYING_CACHE_DIR
         try:
             data = json.loads((cache_dir / "nowplaying.json").read_text(encoding="utf-8-sig"))
         except Exception:
@@ -687,7 +688,7 @@ class MusicModeWindow(tk.Toplevel):
         on_closed:         callback() -> None, called when this window closes
                             (the main window should show itself again then)
         colors:             dict with BG/BG_LIGHT/FG/ACCENT/ACCENT_DARK/STATUS_TEXT
-                            (same shape as parameters.ACTIVE_SCHEME)
+                            (same shape as config.ACTIVE_SCHEME)
         """
         super().__init__(parent)
         self.title("Music Mode")
@@ -751,7 +752,7 @@ class MusicModeWindow(tk.Toplevel):
 
     def _build_disc(self, parent: ttk.Frame) -> None:
         colors = self.colors
-        size = parameters.DISC_SIZE
+        size = config.DISC_SIZE
         self.disc_canvas = tk.Canvas(parent, width=size, height=size,
                                       bg=colors["BG"], highlightthickness=0)
         self.disc_canvas.pack()
@@ -766,7 +767,7 @@ class MusicModeWindow(tk.Toplevel):
         # Small rotating pixel-art dots as a fallback "label" while no real
         # cover art is available (see module docstring)
         self._pixel_ids = []
-        for i in range(parameters.PIXEL_DOT_COUNT):
+        for i in range(config.PIXEL_DOT_COUNT):
             color = colors["ACCENT"] if i % 2 == 0 else colors["ACCENT_DARK"]
             dot_id = self.disc_canvas.create_rectangle(0, 0, 0, 0, fill=color, outline="")
             self._pixel_ids.append(dot_id)
@@ -790,8 +791,8 @@ class MusicModeWindow(tk.Toplevel):
                                        wraplength=size + 20, justify="center")
         self.artist_label.pack()
 
-        have_now_playing_source = (parameters.NOWPLAYING_BRIDGE_EXE.exists()
-                                    or parameters.NOWPLAYING_BRIDGE_SCRIPT.exists()
+        have_now_playing_source = (config.NOWPLAYING_BRIDGE_EXE.exists()
+                                    or config.NOWPLAYING_BRIDGE_SCRIPT.exists()
                                     or _WIN32_AVAILABLE or _DBUS_AVAILABLE)
         if not have_now_playing_source:
             self.track_label.config(text="(no title source available)")
@@ -806,28 +807,28 @@ class MusicModeWindow(tk.Toplevel):
         if not self.winfo_exists():
             return
         if self._playing:
-            self._disc_angle = (self._disc_angle + parameters.SPIN_STEP_DEG) % 360
-        cx = cy = parameters.DISC_SIZE / 2
+            self._disc_angle = (self._disc_angle + config.SPIN_STEP_DEG) % 360
+        cx = cy = config.DISC_SIZE / 2
         count = len(self._pixel_ids)
         for i, dot_id in enumerate(self._pixel_ids):
             angle = math.radians(self._disc_angle + i * (360 / count))
-            x = cx + parameters.PIXEL_DOT_RADIUS * math.cos(angle)
-            y = cy + parameters.PIXEL_DOT_RADIUS * math.sin(angle)
-            half = parameters.PIXEL_DOT_SIZE / 2
+            x = cx + config.PIXEL_DOT_RADIUS * math.cos(angle)
+            y = cy + config.PIXEL_DOT_RADIUS * math.sin(angle)
+            half = config.PIXEL_DOT_SIZE / 2
             self.disc_canvas.coords(dot_id, x - half, y - half, x + half, y + half)
 
         if self._cover_frames:
-            idx = int(self._disc_angle // parameters.SPIN_STEP_DEG) % len(self._cover_frames)
+            idx = int(self._disc_angle // config.SPIN_STEP_DEG) % len(self._cover_frames)
             if idx != self._cover_frame_idx:
                 self._cover_frame_idx = idx
                 self.disc_canvas.itemconfig(self._cover_image_item, image=self._cover_frames[idx])
 
-        self.after(parameters.SPIN_INTERVAL_MS, self._spin_disc)
+        self.after(config.SPIN_INTERVAL_MS, self._spin_disc)
 
     def _build_plots(self, parent: ttk.Frame) -> None:
         colors = self.colors
-        bar_w, bar_h = parameters.BAR_CANVAS_WIDTH, parameters.BAR_CANVAS_HEIGHT
-        wave_w, wave_h = parameters.WAVE_CANVAS_WIDTH, parameters.WAVE_CANVAS_HEIGHT
+        bar_w, bar_h = config.BAR_CANVAS_WIDTH, config.BAR_CANVAS_HEIGHT
+        wave_w, wave_h = config.WAVE_CANVAS_WIDTH, config.WAVE_CANVAS_HEIGHT
         header_font = ("Segoe UI", 9, "bold")
 
         ttk.Label(parent, text="Spectrum", font=header_font).pack(anchor="w")
@@ -836,9 +837,9 @@ class MusicModeWindow(tk.Toplevel):
         self.bar_canvas.pack(pady=(3, 10))
         for frac in (0.25, 0.5, 0.75):   # faint guide lines behind the bars
             self.bar_canvas.create_line(0, bar_h * frac, bar_w, bar_h * frac, fill=colors["BG"])
-        self._peaks = [0.0] * parameters.N_BARS
+        self._peaks = [0.0] * config.N_BARS
         self._peak_ids = []
-        for _ in range(parameters.N_BARS):
+        for _ in range(config.N_BARS):
             self._bar_ids.append(self.bar_canvas.create_rectangle(
                 0, bar_h, 0, bar_h, fill=colors["ACCENT"], width=0))
             self._peak_ids.append(self.bar_canvas.create_rectangle(
@@ -859,8 +860,8 @@ class MusicModeWindow(tk.Toplevel):
         mapping.columnconfigure(2, weight=1)
 
         options = ["None"] + [self.channel_names[c] for c in sorted(self.channel_names)]
-        for row, source in enumerate(parameters.SOURCES):
-            ttk.Label(mapping, text=parameters.SOURCE_LABELS[source], width=8).grid(
+        for row, source in enumerate(config.SOURCES):
+            ttk.Label(mapping, text=config.SOURCE_LABELS[source], width=8).grid(
                 row=row, column=0, sticky="w", pady=4)
 
             var = tk.StringVar(value="None")
@@ -952,8 +953,8 @@ class MusicModeWindow(tk.Toplevel):
     def _update_bars(self, bars) -> None:
         if bars is None:
             return
-        bar_w, bar_h = parameters.BAR_CANVAS_WIDTH, parameters.BAR_CANVAS_HEIGHT
-        slot = bar_w / parameters.N_BARS
+        bar_w, bar_h = config.BAR_CANVAS_WIDTH, config.BAR_CANVAS_HEIGHT
+        slot = bar_w / config.N_BARS
         gap = 3
         for i, level in enumerate(bars):
             x0 = i * slot + gap / 2
@@ -961,7 +962,7 @@ class MusicModeWindow(tk.Toplevel):
             self.bar_canvas.coords(self._bar_ids[i], x0, bar_h - level * bar_h, x1, bar_h)
 
             # peak cap: jumps up with the bar, then falls slowly
-            peak = max(level, self._peaks[i] - parameters.SPECTRUM_PEAK_DECAY)
+            peak = max(level, self._peaks[i] - config.SPECTRUM_PEAK_DECAY)
             self._peaks[i] = peak
             py = bar_h - peak * bar_h
             self.bar_canvas.coords(self._peak_ids[i], x0, py - 2, x1, py)
@@ -969,10 +970,10 @@ class MusicModeWindow(tk.Toplevel):
     def _update_waveform(self, waveform) -> None:
         if waveform is None or len(waveform) < 2:
             return
-        wave_w, wave_h = parameters.WAVE_CANVAS_WIDTH, parameters.WAVE_CANVAS_HEIGHT
+        wave_w, wave_h = config.WAVE_CANVAS_WIDTH, config.WAVE_CANVAS_HEIGHT
         n = len(waveform)
         mid_y = wave_h / 2
-        boost = parameters.WAVE_DISPLAY_GAIN
+        boost = config.WAVE_DISPLAY_GAIN
         points = []
         for i, sample in enumerate(waveform):
             x = i / (n - 1) * wave_w
@@ -1005,7 +1006,7 @@ class MusicModeWindow(tk.Toplevel):
         if key == self._cover_key and self._cover_frames:
             return  # same cover already on the disc
         try:
-            cover_size = parameters.COVER_SIZE
+            cover_size = config.COVER_SIZE
             img = Image.open(io.BytesIO(cover_bytes)).convert("RGBA")
             img = img.resize((cover_size, cover_size), Image.LANCZOS)
             mask = Image.new("L", (cover_size, cover_size), 0)
@@ -1016,7 +1017,7 @@ class MusicModeWindow(tk.Toplevel):
             # PhotoImage on every animation tick (and letting the garbage collector
             # free them from whatever thread it happens to run on) can hang Tk.
             # PIL rotates counter-clockwise, so negate to spin clockwise
-            step = parameters.SPIN_STEP_DEG
+            step = config.SPIN_STEP_DEG
             frames = [ImageTk.PhotoImage(img.rotate(-a, resample=Image.BICUBIC))
                       for a in range(0, 360, step)]
             self._cover_frames = frames

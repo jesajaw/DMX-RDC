@@ -31,7 +31,8 @@ import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk
 
-from .config import parameters
+from . import config
+
 from .controller import Controller, PresetManager, apply_dark_titlebar, force_dark_titlebar
 from .musicmode import MusicModeWindow
 
@@ -41,13 +42,13 @@ class DMXUI:
         self.root = root
         apply_dark_titlebar(root)
         self.root.title("DMX Derby Controller")
-        self.root.configure(bg=parameters.COLOR_BG)
+        self.root.configure(bg=config.COLOR_BG)
 
         self.dmx: Controller | None = None
         self.is_sending = False
         self.channel_labels: dict[int, ttk.Label] = {}
         self.sliders: dict[int, ttk.Scale] = {}
-        self.presets = PresetManager(parameters.PRESETS_DIR)
+        self.presets = PresetManager(config.PRESETS_DIR)
 
         self._setup_style()
         self._build_connection_bar()
@@ -124,33 +125,33 @@ class DMXUI:
         style = ttk.Style()
         style.theme_use("clam")
 
-        style.configure(".", background=parameters.COLOR_BG, foreground=parameters.COLOR_FG, font=("Segoe UI", 9))
-        style.configure("TFrame", background=parameters.COLOR_BG)
-        style.configure("TLabelframe", background=parameters.COLOR_BG, foreground=parameters.COLOR_FG, bordercolor=parameters.COLOR_DARK)
-        style.configure("TLabelframe.Label", background=parameters.COLOR_BG, foreground=parameters.COLOR)
-        style.configure("TLabel", background=parameters.COLOR_BG, foreground=parameters.COLOR_FG)
+        style.configure(".", background=config.COLOR_BG, foreground=config.COLOR_FG, font=("Segoe UI", 9))
+        style.configure("TFrame", background=config.COLOR_BG)
+        style.configure("TLabelframe", background=config.COLOR_BG, foreground=config.COLOR_FG, bordercolor=config.COLOR_DARK)
+        style.configure("TLabelframe.Label", background=config.COLOR_BG, foreground=config.COLOR)
+        style.configure("TLabel", background=config.COLOR_BG, foreground=config.COLOR_FG)
 
-        style.configure("TButton", background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, bordercolor=parameters.COLOR_DARK, focusthickness=1, padding=6)
-        style.map("TButton", background=[("active", parameters.COLOR_DARK), ("pressed", parameters.COLOR)], foreground=[("active", parameters.COLOR_FG)])
+        style.configure("TButton", background=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, bordercolor=config.COLOR_DARK, focusthickness=1, padding=6)
+        style.map("TButton", background=[("active", config.COLOR_DARK), ("pressed", config.COLOR)], foreground=[("active", config.COLOR_FG)])
 
-        style.configure("TCombobox", fieldbackground=parameters.COLOR_BG_LIGHT, background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, arrowcolor=parameters.COLOR)
-        style.map("TCombobox", fieldbackground=[("readonly", parameters.COLOR_BG_LIGHT)])
+        style.configure("TCombobox", fieldbackground=config.COLOR_BG_LIGHT, background=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, arrowcolor=config.COLOR)
+        style.map("TCombobox", fieldbackground=[("readonly", config.COLOR_BG_LIGHT)])
         # A combobox's popup listbox is a native Tk Listbox widget, not a ttk
         # widget -- style.configure doesn't reach it, only option_add does
-        self.root.option_add("*TCombobox*Listbox.background", parameters.COLOR_BG_LIGHT)
-        self.root.option_add("*TCombobox*Listbox.foreground", parameters.COLOR_FG)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", parameters.COLOR_DARK)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", parameters.COLOR_FG)
+        self.root.option_add("*TCombobox*Listbox.background", config.COLOR_BG_LIGHT)
+        self.root.option_add("*TCombobox*Listbox.foreground", config.COLOR_FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", config.COLOR_DARK)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", config.COLOR_FG)
 
-        style.configure("Horizontal.TScale", background=parameters.COLOR_BG, troughcolor=parameters.COLOR_BG_LIGHT)
-        style.configure("TEntry", fieldbackground=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, insertcolor=parameters.COLOR_FG)
+        style.configure("Horizontal.TScale", background=config.COLOR_BG, troughcolor=config.COLOR_BG_LIGHT)
+        style.configure("TEntry", fieldbackground=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, insertcolor=config.COLOR_FG)
 
-        style.configure("Blackout.TButton", background=parameters.COLOR_DARK, foreground=parameters.COLOR_FG)
-        style.map("Blackout.TButton", background=[("active", parameters.COLOR)])
+        style.configure("Blackout.TButton", background=config.COLOR_DARK, foreground=config.COLOR_FG)
+        style.map("Blackout.TButton", background=[("active", config.COLOR)])
 
-        style.configure("Cell.TFrame", background=parameters.COLOR_BG_LIGHT, bordercolor=parameters.COLOR_DARK)
-        style.configure("Status.TLabel", background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_STATUS_TEXT, font=("Consolas", 9))
-        style.configure("CellTitle.TLabel", background=parameters.COLOR_BG_LIGHT, foreground=parameters.COLOR_FG, font=("Segoe UI", 9, "bold"))
+        style.configure("Cell.TFrame", background=config.COLOR_BG_LIGHT, bordercolor=config.COLOR_DARK)
+        style.configure("Status.TLabel", background=config.COLOR_BG_LIGHT, foreground=config.COLOR_STATUS_TEXT, font=("Consolas", 9))
+        style.configure("CellTitle.TLabel", background=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, font=("Segoe UI", 9, "bold"))
 
     # --------- UI
     def _build_connection_bar(self) -> None:
@@ -174,22 +175,22 @@ class DMXUI:
         grid = ttk.LabelFrame(self.root, text="DMX Channels", padding=10)
         grid.pack(fill="both", expand=True, padx=10, pady=5)
 
-        for i in range(parameters.CHANNEL_COUNT):
+        for i in range(config.CHANNEL_COUNT):
             channel = i + 1
             row, col = divmod(i, 3)
             grid.columnconfigure(col, weight=1)
-            self._build_cell(grid, row, col, channel, parameters.CHANNEL_NAMES[i])
+            self._build_cell(grid, row, col, channel, config.CHANNEL_NAMES[i])
 
     def _build_cell(self, parent: ttk.Frame, row: int, col: int, channel: int, name: str) -> None:
         cell = ttk.Frame(parent, padding=5, relief="groove", style="Cell.TFrame")
         cell.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
         cell.pack_propagate(False)
-        cell.configure(width=parameters.CELL_WIDTH, height=parameters.CELL_HEIGHT)
+        cell.configure(width=config.CELL_WIDTH, height=config.CELL_HEIGHT)
 
         ttk.Label(cell, text=name, style="CellTitle.TLabel").pack(anchor="w")
 
         status = ttk.Label(cell, text="---", style="Status.TLabel",
-                            width=parameters.STATUS_LABEL_CHARS, anchor="w")
+                            width=config.STATUS_LABEL_CHARS, anchor="w")
         status.pack(anchor="w", pady=(2, 5), fill="x")
         self.channel_labels[channel] = status
 
@@ -216,14 +217,14 @@ class DMXUI:
         ttk.Button(bar, text="Delete", command=self.delete_preset).pack(side="left", padx=5)
 
     def _open_music_mode(self) -> None:
-        channel_names = {ch: parameters.CHANNEL_NAMES[ch - 1] for ch in range(1, parameters.CHANNEL_COUNT + 1)}
+        channel_names = {ch: config.CHANNEL_NAMES[ch - 1] for ch in range(1, config.CHANNEL_COUNT + 1)}
         window = MusicModeWindow(
             self.root,
             channel_names=channel_names,
             set_channel_value=self._music_set_channel,
             restore_sliders=self._music_restore_sliders,
             on_closed=self._on_music_mode_closed,
-            colors=parameters.ACTIVE_SCHEME,
+            colors=config.ACTIVE_SCHEME,
         )
         window.update_idletasks()
         self.root.withdraw()
@@ -307,7 +308,7 @@ class DMXUI:
             except (serial.SerialException, OSError) as e:
                 self.root.after(0, self._connection_lost, e)
                 return
-            time.sleep(parameters.SEND_INTERVAL_S)
+            time.sleep(config.SEND_INTERVAL_S)
 
 
     # --------- actions
@@ -377,7 +378,7 @@ class ThemedDialog(tk.Toplevel):
     def __init__(self, parent: tk.Tk, title: str, message: str, buttons: list[str], with_entry: bool = False):
         super().__init__(parent)
         self.title(title)
-        self.configure(bg=parameters.COLOR_BG)
+        self.configure(bg=config.COLOR_BG)
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()

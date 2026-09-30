@@ -1,7 +1,9 @@
-# Python build artifacts (not __pycache__, see project decision)
-*.egg-info/
-build/
-dist/
+# cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyc
 
 # Virtual environments
 .venv/
@@ -23,3 +25,8 @@ src/out/
 
 # Runtime cache of NowPlayingBridge (title/artist/album/cover cache)
 nowplaying_cache/
+
+# Logs & Generated Runtime Files
+*.log
+nowplaying.json
+nowplaying_cover.img

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import serial
 
-from .config import parameters
+from . import config
 
 
 def _is_windows() -> bool:
@@ -54,7 +54,7 @@ class Controller:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_TWO,
         )
-        self.data = bytearray(parameters.UNIVERSE_SIZE)
+        self.data = bytearray(config.UNIVERSE_SIZE)
 
     def set_channel(self, channel: int, value: int) -> None:
         if 1 <= channel <= 512:
@@ -70,7 +70,7 @@ class Controller:
 
     def stop(self) -> None:
         # zeroes all channels, sends once, then closes the port
-        for i in range(1, parameters.UNIVERSE_SIZE):
+        for i in range(1, config.UNIVERSE_SIZE):
             self.data[i] = 0
         try:
             self.send()
