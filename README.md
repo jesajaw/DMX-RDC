@@ -116,9 +116,6 @@ Each preset is a plain JSON file: `presets/<name>.json`:
 - DMX512 is a unidirectional protocol: the controller has no way to confirm that a fixture is actually receiving data, only that the USB-DMX adapter itself is reachable over serial.
 - Tested on Windows with a generic USB-DMX (FTDI-based) adapter. That's the primary, fully-tested platform.
 - **Linux support is groundwork, not verified**: the code paths exist (PulseAudio/PipeWire loopback capture, MPRIS-based title/artist/cover via `jeepney`) but haven't been tested against a real PulseAudio/PipeWire/D-Bus setup. If audio capture or Now Playing don't pick anything up, check `pactl list sources short` for your monitor source name, and `busctl --user list | grep mpris` for an active MPRIS player — `src/musicmode.py`'s `_resolve_loopback_device` and `_fetch_mpris_metadata` are the places to adjust if the exact names/shapes differ on your system.
-- macOS is untested and currently unsupported for Music Mode (no loopback backend implemented); the rest of the app should still work.
-- Cover art on Windows needs the optional compiled `NowPlayingBridge.exe` (see above) — without it, you still get title/artist/album via the PowerShell script, just no cover, and if that script can't run either, a window-title fallback for a smaller, hardcoded list of known player processes (`KNOWN_PLAYER_PROCESSES` in `src/config.py`).
-- `NowPlayingBridge.ps1` deliberately does not attempt cover art after multiple PowerShell/WinRT interop workarounds (DataReader, `AsStreamForRead`, a self-constructed `IBuffer`) all hit variants of the same underlying problem: PowerShell's late-bound COM objects only reliably dispatch directly-declared interface members, not inherited ones like `IInputStream.ReadAsync`. `NowPlayingBridge.exe` (compiled C#, real WinRT/await support) doesn't have this limitation.
 
 ## 📜 License
 
