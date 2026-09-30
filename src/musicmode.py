@@ -83,6 +83,7 @@ import io
 import json
 import logging
 import math
+import os
 import subprocess
 import sys
 import threading
@@ -169,11 +170,11 @@ class AudioAnalyzer:
     """
 
     def __init__(self, on_frame, blocksize: int = parameters.BLOCK_SIZE,
-                 gain: float = 1.5, smoothing: float = 0.7, n_bars: int = parameters.N_BARS):
+                 gain: float = 1.0, smoothing: float = 0.6, n_bars: int = parameters.N_BARS):
         self.on_frame = on_frame            # callback(frame: AudioFrame)
         self.blocksize = blocksize
-        self.gain = gain                    # sensitivity, adjustable live
-        self.smoothing = smoothing          # 0..~0.95, higher = slower/smoother
+        self.gain = gain                    # sensitivity, adjustable live (>1 boosts quiet parts, <1 suppresses them)
+        self.smoothing = smoothing          # 0..~0.95, higher = slower fall-off (rises are always instant)
         self.n_bars = n_bars
         self.samplerate = parameters.SAMPLE_RATE  # placeholder, replaced in start() by the real device
         self._channels = 2                  # placeholder, replaced in start() by the real device
@@ -184,10 +185,17 @@ class AudioAnalyzer:
         self._levels = {"bass": 0.0, "mid": 0.0, "treble": 0.0}
         self._bar_levels = np.zeros(n_bars)
         self._bar_edges = np.geomspace(parameters.BAR_FREQ_RANGE[0], parameters.BAR_FREQ_RANGE[1], n_bars + 1)
-        self._window = np.hanning(blocksize)
         self._energy_history = deque(maxlen=parameters.ENERGY_HISTORY_LEN)
         self._beat_level = 0.0
-        self._pitch_level = 0.0
+        self._beat_cooldown = 0
+        self._pitch_level = 0.5
+        self._pitch_lo = 0.4
+        self._pitch_hi = 0.6
+        self._band_ref = {name: -120.0 for name in parameters.BAND_RANGES}  # loudest recent dB per band (auto-gain)
+        self._bars_ref = -120.0
+        self._layout_sr = None              # sample rate the FFT index tables below were built for
+        self._buf = None
+        self._error_logged = False
 
     def start(self) -> None:
         if self._running:
@@ -268,43 +276,116 @@ class AudioAnalyzer:
         samples = np.frombuffer(in_data, dtype=np.float32)
         if self._channels > 1:
             samples = samples.reshape(-1, self._channels).mean(axis=1)
-        self._process(samples)
+        try:
+            self._process(samples)
+        except Exception:
+            if not self._error_logged:      # log once, never spam from the audio thread
+                self._error_logged = True
+                logging.exception("Audio analysis failed")
         return (None, pyaudio.paContinue)
 
+    # ---- analysis helpers
+    def _ensure_layout(self) -> None:
+        """(Re)builds FFT window and bin-index tables when the sample rate is known/changed."""
+        sr = self.samplerate
+        if self._layout_sr == sr:
+            return
+        fft = parameters.FFT_SIZE
+        self._window = np.hanning(fft)
+        self._mag_scale = 2.0 / self._window.sum()   # a full-scale sine -> magnitude 1.0
+        self._power_scale = 1.0 / (2.0 * 1.5)        # magnitude^2 -> mean-square power (Hann noise bandwidth = 1.5 bins)
+        freqs = np.fft.rfftfreq(fft, d=1.0 / sr)
+
+        def bins(lo: float, hi: float) -> np.ndarray:
+            ids = np.where((freqs >= lo) & (freqs < hi))[0]
+            if len(ids) == 0:                        # band narrower than one bin -> use the nearest bin
+                ids = np.array([int(np.argmin(np.abs(freqs - (lo * hi) ** 0.5)))])
+            return ids
+
+        self._band_idx = {name: bins(lo, hi) for name, (lo, hi) in parameters.BAND_RANGES.items()}
+        self._kick_idx = bins(*parameters.BEAT_BAND)
+        edges = self._bar_edges
+        self._bar_idx = [bins(edges[i], edges[i + 1]) for i in range(self.n_bars)]
+        centers = np.sqrt(edges[:-1] * edges[1:])
+        self._bar_tilt = parameters.SPECTRUM_TILT_DB_PER_OCT * np.log2(centers / 1000.0)
+        self._bar_pos = np.arange(self.n_bars) / max(1, self.n_bars - 1)
+        self._buf = np.zeros(fft, dtype=np.float32)
+        self._layout_sr = sr
+
+    @staticmethod
+    def _norm(db: float, top_db: float, range_db: float) -> float:
+        """Maps [top-range .. top] dB linearly to 0..1."""
+        return float(min(1.0, max(0.0, (db - (top_db - range_db)) / range_db)))
+
+    def _fall(self, previous: float, new: float) -> float:
+        """Instant attack, smoothed release."""
+        return new if new > previous else self.smoothing * previous + (1 - self.smoothing) * new
+
     def _process(self, samples: np.ndarray) -> None:
-        window = self._window if len(samples) == len(self._window) else np.hanning(len(samples))
-        windowed = samples * window
-        spectrum = np.abs(np.fft.rfft(windowed)) / len(windowed)
-        freqs = np.fft.rfftfreq(len(windowed), d=1.0 / self.samplerate)
+        self._ensure_layout()
+        n = len(samples)
+        fft = parameters.FFT_SIZE
+        if n >= fft:
+            self._buf = samples[-fft:].astype(np.float32)
+        else:
+            self._buf = np.concatenate((self._buf[n:], samples.astype(np.float32)))
 
-        for name, (lo, hi) in parameters.BAND_RANGES.items():
-            mask = (freqs >= lo) & (freqs < hi)
-            energy = float(np.sqrt(np.mean(spectrum[mask] ** 2))) if mask.any() else 0.0
-            level = min(1.0, energy * self.gain)
-            self._levels[name] = self.smoothing * self._levels[name] + (1 - self.smoothing) * level
+        mag = np.abs(np.fft.rfft(self._buf * self._window)) * self._mag_scale
+        power = mag * mag * self._power_scale      # mean-square power per bin
+        decay = parameters.AGC_DECAY_DB_PER_S * n / self.samplerate
+        gamma = 1.0 / max(self.gain, 0.05)         # sensitivity: >1 lifts quiet parts, <1 suppresses them
 
-        for i in range(self.n_bars):
-            lo, hi = self._bar_edges[i], self._bar_edges[i + 1]
-            mask = (freqs >= lo) & (freqs < hi)
-            energy = float(np.sqrt(np.mean(spectrum[mask] ** 2))) if mask.any() else 0.0
-            level = min(1.0, energy * self.gain)
-            self._bar_levels[i] = self.smoothing * self._bar_levels[i] + (1 - self.smoothing) * level
+        # --- bass/mid/treble: band RMS in dB, each band normalised to its own recent peak
+        for name, idx in self._band_idx.items():
+            db = 10.0 * math.log10(float(power[idx].sum()) + 1e-12)
+            ref = max(db, self._band_ref[name] - decay)
+            self._band_ref[name] = ref
+            level = self._norm(db, max(ref, parameters.AGC_MIN_REF_BAND_DB), parameters.DB_RANGE_BAND) ** gamma
+            self._levels[name] = self._fall(self._levels[name], level)
 
-        # Beat/onset: total energy vs. its rolling average over the last ~1s
-        total_energy = float(np.sqrt(np.mean(spectrum ** 2)))
-        avg_energy = float(np.mean(self._energy_history)) if self._energy_history else 0.0
-        self._energy_history.append(total_energy)
-        is_onset = (avg_energy > 0 and total_energy > avg_energy * parameters.BEAT_THRESHOLD_RATIO
-                    and total_energy > parameters.BEAT_MIN_ENERGY)
-        self._beat_level = max(1.0 if is_onset else 0.0, self._beat_level * parameters.BEAT_DECAY)
+        # --- spectrum bars: one shared reference so the spectrum keeps its shape
+        bar_db = np.array([10.0 * math.log10(float(power[idx].sum()) + 1e-12) for idx in self._bar_idx])
+        bar_db = bar_db + self._bar_tilt
+        self._bars_ref = max(float(bar_db.max()), self._bars_ref - decay)
+        top = max(self._bars_ref, parameters.AGC_MIN_REF_BARS_DB)
+        raw = np.clip((bar_db - (top - parameters.DB_RANGE_BARS)) / parameters.DB_RANGE_BARS, 0.0, 1.0)
+        shown = raw ** gamma
+        self._bar_levels = np.where(shown > self._bar_levels, shown,
+                                    self.smoothing * self._bar_levels + (1 - self.smoothing) * shown)
 
-        # Pitch: normalized spectral centroid (0 = bassy, 1 = bright)
-        magnitude_sum = float(np.sum(spectrum))
-        centroid = float(np.sum(freqs * spectrum) / magnitude_sum) if magnitude_sum > 0 else 0.0
-        pitch_norm = min(1.0, centroid / parameters.PITCH_REFERENCE_HZ)
-        self._pitch_level = self.smoothing * self._pitch_level + (1 - self.smoothing) * pitch_norm
+        # --- beat: kick-band onset vs. its ~1s average, with a short dead time
+        kick = math.sqrt(float(power[self._kick_idx].sum()))
+        avg = float(np.mean(self._energy_history)) if self._energy_history else 0.0
+        self._energy_history.append(kick)
+        if self._beat_cooldown > 0:
+            self._beat_cooldown -= 1
+        onset = (self._beat_cooldown == 0 and avg > 0
+                 and kick > avg * parameters.BEAT_THRESHOLD_RATIO
+                 and kick > parameters.BEAT_MIN_RMS)
+        if onset:
+            self._beat_level = 1.0
+            self._beat_cooldown = parameters.BEAT_COOLDOWN_BLOCKS
+        else:
+            self._beat_level *= parameters.BEAT_DECAY
 
-        step = max(1, len(samples) // parameters.WAVE_POINTS)
+        # --- pitch: centroid over the log-spaced bars (0 = lowest bar, 1 = highest),
+        # stretched to the range it recently used so it actually moves across 0..1
+        weights = raw * raw
+        total = float(weights.sum())
+        if total > 1e-3:                            # silence -> hold the last value
+            centroid = float((weights * self._bar_pos).sum() / total)
+            rate = parameters.PITCH_ADAPT_RATE
+            self._pitch_lo = min(centroid, self._pitch_lo + rate)
+            self._pitch_hi = max(centroid, self._pitch_hi - rate)
+            lo, hi = self._pitch_lo, self._pitch_hi
+            if hi - lo < parameters.PITCH_SPAN_MIN:
+                mid = (lo + hi) / 2
+                lo, hi = mid - parameters.PITCH_SPAN_MIN / 2, mid + parameters.PITCH_SPAN_MIN / 2
+            target = min(1.0, max(0.0, (centroid - lo) / (hi - lo)))
+            s = max(self.smoothing, parameters.PITCH_SMOOTHING_MIN)
+            self._pitch_level = s * self._pitch_level + (1 - s) * target
+
+        step = max(1, n // parameters.WAVE_POINTS)
         waveform = np.clip(samples[::step], -1.0, 1.0)
 
         self.on_frame(AudioFrame(
@@ -421,8 +502,7 @@ class NowPlayingReader:
          the Windows volume flyout preview). Real compiler-level WinRT/await
          support, so this is the most reliable option.
       2. NowPlayingBridge.ps1 (plain PowerShell, ships as-is, no install/build
-         step) -- title, artist, album, but deliberately no cover art (see the
-         script's own docstring for why).
+         step) -- title, artist, album, playing state and cover art.
       3. Plain window-title heuristic over known media player processes
          (parameters.KNOWN_PLAYER_PROCESSES), e.g. "Artist - Title" for
          Spotify -- title/artist only, no album, no cover. Stays inactive
@@ -441,8 +521,10 @@ class NowPlayingReader:
     # up on it and falls back further down the priority list.
     BRIDGE_MISS_LIMIT = 10
 
-    def __init__(self, on_update, poll_interval: float = 1.0):
+    def __init__(self, on_update, poll_interval: float = 1.0, on_playing=None):
         self.on_update = on_update  # callback(title: str, artist: str, cover_bytes: bytes | None)
+        self.on_playing = on_playing  # optional callback(playing: bool), bridge only
+        self._last_playing = None
         self.poll_interval = poll_interval
         self._running = False
         self._thread = None
@@ -475,8 +557,12 @@ class NowPlayingReader:
         if self._process is not None:
             try:
                 self._process.terminate()
+                self._process.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
             self._process = None
         if self._log_file is not None:
             try:
@@ -496,7 +582,10 @@ class NowPlayingReader:
             else:  # "ps1"
                 args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                         "-File", str(parameters.NOWPLAYING_BRIDGE_SCRIPT),
-                        str(cache_dir), str(int(self.poll_interval * 1000))]
+                        str(cache_dir), str(int(self.poll_interval * 1000)),
+                        str(os.getpid())]   # 3rd arg: bridge exits when this process is gone
+                if parameters.NOWPLAYING_DEBUG:
+                    args.append("-RunDebug")
             self._process = subprocess.Popen(
                 args,
                 creationflags=subprocess.CREATE_NO_WINDOW,
@@ -524,7 +613,7 @@ class NowPlayingReader:
     def _poll_bridge_files(self) -> None:
         cache_dir = parameters.NOWPLAYING_CACHE_DIR
         try:
-            data = json.loads((cache_dir / "nowplaying.json").read_text(encoding="utf-8"))
+            data = json.loads((cache_dir / "nowplaying.json").read_text(encoding="utf-8-sig"))
         except Exception:
             self._bridge_miss_count += 1
             if self._bridge_miss_count >= self.BRIDGE_MISS_LIMIT:
@@ -543,6 +632,12 @@ class NowPlayingReader:
             return
         self._bridge_miss_count = 0
 
+        playing = bool(data.get("playing", True))  # the .exe doesn't report it -> assume playing
+        if playing != self._last_playing:
+            self._last_playing = playing
+            if self.on_playing:
+                self.on_playing(playing)
+
         title = data.get("title", "")
         artist = data.get("artist", "")
         has_cover = bool(data.get("hasCover", False))
@@ -556,6 +651,7 @@ class NowPlayingReader:
             try:
                 cover_bytes = (cache_dir / "nowplaying_cover.img").read_bytes()
             except Exception:
+                logging.warning("hasCover is true but nowplaying_cover.img can't be read")
                 cover_bytes = None
 
         self.on_update(title, artist, cover_bytes)
@@ -618,25 +714,40 @@ class MusicModeWindow(tk.Toplevel):
         self.analyzer.start()
 
     # --------- Layout
+    def _init_styles(self) -> None:
+        colors = self.colors
+        style = ttk.Style(self)
+        style.configure("Meter.Horizontal.TProgressbar",
+                        troughcolor=colors["BG_LIGHT"], background=colors["ACCENT"],
+                        bordercolor=colors["BG_LIGHT"], lightcolor=colors["ACCENT"],
+                        darkcolor=colors["ACCENT"], thickness=10)
+
     def _build(self) -> None:
-        viz = ttk.LabelFrame(self, text="Now Playing", padding=10)
-        viz.pack(fill="x", padx=10, pady=(10, 5))
+        # Two-column dashboard: [ disc | visualizer ] on top, [ mapping | settings ] below.
+        self._init_styles()
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
 
-        plots_row = ttk.Frame(viz)
-        plots_row.pack()
-        self._build_plots(plots_row)
+        now = ttk.LabelFrame(self, text="Now Playing", padding=12)
+        now.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=(12, 6))
+        self._build_disc(now)
 
-        disc_row = ttk.Frame(viz)
-        disc_row.pack(pady=(12, 0))
-        self._build_disc(disc_row)
+        viz = ttk.LabelFrame(self, text="Visualizer", padding=12)
+        viz.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=(12, 6))
+        self._build_plots(viz)
 
-        self._build_mapping()
-        self._build_settings()
+        bottom = ttk.Frame(self)
+        bottom.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=6)
+        bottom.columnconfigure(0, weight=3, uniform="bottom")
+        bottom.columnconfigure(1, weight=2, uniform="bottom")
+        self._build_mapping(bottom)
+        self._build_settings(bottom)
 
-        self.status_label = ttk.Label(self, text="", foreground="#c0392b")
-        self.status_label.pack(pady=(4, 0))
-
-        ttk.Button(self, text="Back to Manual Control", command=self._on_close).pack(pady=10)
+        footer = ttk.Frame(self)
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(6, 12))
+        self.status_label = ttk.Label(footer, text="", foreground="#c0392b")
+        self.status_label.pack(side="left")
+        ttk.Button(footer, text="Back to Manual Control", command=self._on_close).pack(side="right")
 
     def _build_disc(self, parent: ttk.Frame) -> None:
         colors = self.colors
@@ -666,12 +777,18 @@ class MusicModeWindow(tk.Toplevel):
         # the pixel dots once a cover is actually set (image=None draws nothing)
         self._cover_image_item = self.disc_canvas.create_image(cx, cy, image=None)
         self._cover_photo = None   # keep a reference, or Tkinter garbage-collects the image
-        self._base_cover = None    # circularly masked, unrotated PIL image
+        self._cover_frames = []    # pre-rotated PhotoImages, built once per cover (main thread only)
+        self._cover_key = None     # identifies the cover the frames were built from
+        self._cover_frame_idx = -1
         self._disc_angle = 0.0
+        self._playing = True       # disc only spins while music is playing
 
-        self.track_label = ttk.Label(parent, text="", font=("Segoe UI", 9, "bold"),
+        self.track_label = ttk.Label(parent, text="", font=("Segoe UI", 11, "bold"),
                                       wraplength=size + 20, justify="center")
-        self.track_label.pack(pady=(5, 0))
+        self.track_label.pack(pady=(10, 0))
+        self.artist_label = ttk.Label(parent, text="", foreground=colors["STATUS_TEXT"],
+                                       wraplength=size + 20, justify="center")
+        self.artist_label.pack()
 
         have_now_playing_source = (parameters.NOWPLAYING_BRIDGE_EXE.exists()
                                     or parameters.NOWPLAYING_BRIDGE_SCRIPT.exists()
@@ -679,7 +796,8 @@ class MusicModeWindow(tk.Toplevel):
         if not have_now_playing_source:
             self.track_label.config(text="(no title source available)")
         else:
-            self.now_playing = NowPlayingReader(on_update=self._on_now_playing)
+            self.now_playing = NowPlayingReader(on_update=self._on_now_playing,
+                                             on_playing=self._on_playing)
             self.now_playing.start()
 
         self._spin_disc()
@@ -687,7 +805,8 @@ class MusicModeWindow(tk.Toplevel):
     def _spin_disc(self) -> None:
         if not self.winfo_exists():
             return
-        self._disc_angle = (self._disc_angle + parameters.SPIN_STEP_DEG) % 360
+        if self._playing:
+            self._disc_angle = (self._disc_angle + parameters.SPIN_STEP_DEG) % 360
         cx = cy = parameters.DISC_SIZE / 2
         count = len(self._pixel_ids)
         for i, dot_id in enumerate(self._pixel_ids):
@@ -697,10 +816,11 @@ class MusicModeWindow(tk.Toplevel):
             half = parameters.PIXEL_DOT_SIZE / 2
             self.disc_canvas.coords(dot_id, x - half, y - half, x + half, y + half)
 
-        if _PIL_AVAILABLE and self._base_cover is not None:
-            rotated = self._base_cover.rotate(self._disc_angle, resample=Image.BICUBIC)
-            self._cover_photo = ImageTk.PhotoImage(rotated)
-            self.disc_canvas.itemconfig(self._cover_image_item, image=self._cover_photo)
+        if self._cover_frames:
+            idx = int(self._disc_angle // parameters.SPIN_STEP_DEG) % len(self._cover_frames)
+            if idx != self._cover_frame_idx:
+                self._cover_frame_idx = idx
+                self.disc_canvas.itemconfig(self._cover_image_item, image=self._cover_frames[idx])
 
         self.after(parameters.SPIN_INTERVAL_MS, self._spin_disc)
 
@@ -708,65 +828,75 @@ class MusicModeWindow(tk.Toplevel):
         colors = self.colors
         bar_w, bar_h = parameters.BAR_CANVAS_WIDTH, parameters.BAR_CANVAS_HEIGHT
         wave_w, wave_h = parameters.WAVE_CANVAS_WIDTH, parameters.WAVE_CANVAS_HEIGHT
+        header_font = ("Segoe UI", 9, "bold")
 
-        spectrum_col = ttk.Frame(parent)
-        spectrum_col.pack(side="left", padx=(0, 15))
-        ttk.Label(spectrum_col, text="Spectrum", style="CellTitle.TLabel").pack(anchor="w")
-        self.bar_canvas = tk.Canvas(spectrum_col, width=bar_w, height=bar_h,
+        ttk.Label(parent, text="Spectrum", font=header_font).pack(anchor="w")
+        self.bar_canvas = tk.Canvas(parent, width=bar_w, height=bar_h,
                                      bg=colors["BG_LIGHT"], highlightthickness=0)
-        self.bar_canvas.pack()
-        bar_width = bar_w / parameters.N_BARS
-        for i in range(parameters.N_BARS):
-            x0 = i * bar_width + 2
-            x1 = x0 + bar_width - 4
-            bar_id = self.bar_canvas.create_rectangle(
-                x0, bar_h, x1, bar_h, fill=colors["ACCENT"], width=0)
-            self._bar_ids.append(bar_id)
+        self.bar_canvas.pack(pady=(3, 10))
+        for frac in (0.25, 0.5, 0.75):   # faint guide lines behind the bars
+            self.bar_canvas.create_line(0, bar_h * frac, bar_w, bar_h * frac, fill=colors["BG"])
+        self._peaks = [0.0] * parameters.N_BARS
+        self._peak_ids = []
+        for _ in range(parameters.N_BARS):
+            self._bar_ids.append(self.bar_canvas.create_rectangle(
+                0, bar_h, 0, bar_h, fill=colors["ACCENT"], width=0))
+            self._peak_ids.append(self.bar_canvas.create_rectangle(
+                0, bar_h, 0, bar_h, fill=colors["STATUS_TEXT"], width=0))
 
-        wave_col = ttk.Frame(parent)
-        wave_col.pack(side="left")
-        ttk.Label(wave_col, text="Waveform", style="CellTitle.TLabel").pack(anchor="w")
-        self.wave_canvas = tk.Canvas(wave_col, width=wave_w, height=wave_h,
+        ttk.Label(parent, text="Waveform", font=header_font).pack(anchor="w")
+        self.wave_canvas = tk.Canvas(parent, width=wave_w, height=wave_h,
                                       bg=colors["BG_LIGHT"], highlightthickness=0)
-        self.wave_canvas.pack()
+        self.wave_canvas.pack(pady=(3, 0))
         mid_y = wave_h / 2
+        self.wave_canvas.create_line(0, mid_y, wave_w, mid_y, fill=colors["BG"])
         self._wave_line = self.wave_canvas.create_line(
             0, mid_y, wave_w, mid_y, fill=colors["ACCENT"], width=1.5, smooth=True)
 
-    def _build_mapping(self) -> None:
-        mapping = ttk.LabelFrame(self, text="Channel Mapping", padding=10)
-        mapping.pack(fill="x", padx=10, pady=5)
+    def _build_mapping(self, parent: ttk.Frame) -> None:
+        mapping = ttk.LabelFrame(parent, text="Channel Mapping", padding=12)
+        mapping.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        mapping.columnconfigure(2, weight=1)
 
         options = ["None"] + [self.channel_names[c] for c in sorted(self.channel_names)]
-        for source in parameters.SOURCES:
-            row = ttk.Frame(mapping)
-            row.pack(fill="x", pady=2)
-            ttk.Label(row, text=parameters.SOURCE_LABELS[source], width=8).pack(side="left")
+        for row, source in enumerate(parameters.SOURCES):
+            ttk.Label(mapping, text=parameters.SOURCE_LABELS[source], width=8).grid(
+                row=row, column=0, sticky="w", pady=4)
 
             var = tk.StringVar(value="None")
             self.mapping_vars[source] = var
-            cb = ttk.Combobox(row, values=options, textvariable=var, width=24, state="readonly")
-            cb.pack(side="left", padx=5)
+            cb = ttk.Combobox(mapping, values=options, textvariable=var, width=24, state="readonly")
+            cb.grid(row=row, column=1, padx=10, pady=4)
 
-            meter = ttk.Progressbar(row, orient="horizontal", length=120, maximum=100)
-            meter.pack(side="left", padx=5, fill="x", expand=True)
+            meter = ttk.Progressbar(mapping, orient="horizontal", maximum=100,
+                                    style="Meter.Horizontal.TProgressbar")
+            meter.grid(row=row, column=2, sticky="ew", pady=4)
             self.meters[source] = meter
 
-    def _build_settings(self) -> None:
-        settings = ttk.LabelFrame(self, text="Settings", padding=10)
-        settings.pack(fill="x", padx=10, pady=5)
+    def _build_settings(self, parent: ttk.Frame) -> None:
+        settings = ttk.LabelFrame(parent, text="Settings", padding=12)
+        settings.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        settings.columnconfigure(0, weight=1)
 
-        ttk.Label(settings, text="Sensitivity:").pack(side="left")
+        head = ttk.Frame(settings)
+        head.grid(row=0, column=0, sticky="ew")
+        ttk.Label(head, text="Sensitivity").pack(side="left")
+        self.gain_value = ttk.Label(head, text="", foreground=self.colors["STATUS_TEXT"])
+        self.gain_value.pack(side="right")
         self.gain_scale = ttk.Scale(settings, from_=0.2, to=5.0, orient="horizontal",
                                      command=self._on_gain_change)
         self.gain_scale.set(self.analyzer.gain)
-        self.gain_scale.pack(side="left", padx=5, fill="x", expand=True)
+        self.gain_scale.grid(row=1, column=0, sticky="ew", pady=(2, 14))
 
-        ttk.Label(settings, text="Smoothing:").pack(side="left")
+        head = ttk.Frame(settings)
+        head.grid(row=2, column=0, sticky="ew")
+        ttk.Label(head, text="Smoothing").pack(side="left")
+        self.smooth_value = ttk.Label(head, text="", foreground=self.colors["STATUS_TEXT"])
+        self.smooth_value.pack(side="right")
         self.smooth_scale = ttk.Scale(settings, from_=0.0, to=0.95, orient="horizontal",
                                        command=self._on_smoothing_change)
         self.smooth_scale.set(self.analyzer.smoothing)
-        self.smooth_scale.pack(side="left", padx=5, fill="x", expand=True)
+        self.smooth_scale.grid(row=3, column=0, sticky="ew", pady=(2, 0))
 
     def _channel_for(self, source: str):
         label = self.mapping_vars[source].get()
@@ -780,9 +910,13 @@ class MusicModeWindow(tk.Toplevel):
     # --------- Settings callbacks
     def _on_gain_change(self, value) -> None:
         self.analyzer.gain = float(value)
+        if hasattr(self, "gain_value"):
+            self.gain_value.config(text=f"{float(value):.1f}x")
 
     def _on_smoothing_change(self, value) -> None:
         self.analyzer.smoothing = float(value)
+        if hasattr(self, "smooth_value"):
+            self.smooth_value.config(text=f"{float(value):.2f}")
 
     # --------- Audio frames (worker thread -> GUI thread)
     def _on_frame(self, frame: AudioFrame) -> None:
@@ -819,13 +953,18 @@ class MusicModeWindow(tk.Toplevel):
         if bars is None:
             return
         bar_w, bar_h = parameters.BAR_CANVAS_WIDTH, parameters.BAR_CANVAS_HEIGHT
-        bar_width = bar_w / parameters.N_BARS
+        slot = bar_w / parameters.N_BARS
+        gap = 3
         for i, level in enumerate(bars):
-            x0 = i * bar_width + 2
-            x1 = x0 + bar_width - 4
-            y1 = bar_h
-            y0 = bar_h - level * bar_h
-            self.bar_canvas.coords(self._bar_ids[i], x0, y0, x1, y1)
+            x0 = i * slot + gap / 2
+            x1 = x0 + slot - gap
+            self.bar_canvas.coords(self._bar_ids[i], x0, bar_h - level * bar_h, x1, bar_h)
+
+            # peak cap: jumps up with the bar, then falls slowly
+            peak = max(level, self._peaks[i] - parameters.SPECTRUM_PEAK_DECAY)
+            self._peaks[i] = peak
+            py = bar_h - peak * bar_h
+            self.bar_canvas.coords(self._peak_ids[i], x0, py - 2, x1, py)
 
     def _update_waveform(self, waveform) -> None:
         if waveform is None or len(waveform) < 2:
@@ -833,24 +972,38 @@ class MusicModeWindow(tk.Toplevel):
         wave_w, wave_h = parameters.WAVE_CANVAS_WIDTH, parameters.WAVE_CANVAS_HEIGHT
         n = len(waveform)
         mid_y = wave_h / 2
+        boost = parameters.WAVE_DISPLAY_GAIN
         points = []
         for i, sample in enumerate(waveform):
             x = i / (n - 1) * wave_w
-            y = mid_y - sample * mid_y * 0.9
-            points.extend((x, y))
+            s = max(-1.0, min(1.0, float(sample) * boost))
+            points.extend((x, mid_y - s * mid_y * 0.9))
         self.wave_canvas.coords(self._wave_line, *points)
 
     # --------- Now Playing
+    def _on_playing(self, playing: bool) -> None:
+        self.after(0, self._set_playing, playing)
+
+    def _set_playing(self, playing: bool) -> None:
+        self._playing = playing
+
     def _on_now_playing(self, title: str, artist: str, cover_bytes) -> None:
         self.after(0, self._apply_now_playing, title, artist, cover_bytes)
 
     def _apply_now_playing(self, title: str, artist: str, cover_bytes) -> None:
-        text = f"{title}\n{artist}" if artist else (title or "")
-        self.track_label.config(text=text)
+        self.track_label.config(text=title or "")
+        self.artist_label.config(text=artist or "")
+
+        if not _PIL_AVAILABLE:
+            logging.warning("Pillow is not installed -- no cover art (pip install pillow)")
 
         if not (_PIL_AVAILABLE and cover_bytes):
-            self._base_cover = None
+            self._clear_cover()
             return
+
+        key = hash(cover_bytes)
+        if key == self._cover_key and self._cover_frames:
+            return  # same cover already on the disc
         try:
             cover_size = parameters.COVER_SIZE
             img = Image.open(io.BytesIO(cover_bytes)).convert("RGBA")
@@ -858,10 +1011,26 @@ class MusicModeWindow(tk.Toplevel):
             mask = Image.new("L", (cover_size, cover_size), 0)
             ImageDraw.Draw(mask).ellipse((0, 0, cover_size, cover_size), fill=255)
             img.putalpha(mask)
-            self._base_cover = img
+
+            # Build every rotation ONCE, here on the Tk main thread. Creating/freeing a
+            # PhotoImage on every animation tick (and letting the garbage collector
+            # free them from whatever thread it happens to run on) can hang Tk.
+            # PIL rotates counter-clockwise, so negate to spin clockwise
+            step = parameters.SPIN_STEP_DEG
+            frames = [ImageTk.PhotoImage(img.rotate(-a, resample=Image.BICUBIC))
+                      for a in range(0, 360, step)]
+            self._cover_frames = frames
+            self._cover_key = key
+            self._cover_frame_idx = -1
         except Exception:
             logging.exception("Failed to process cover art")
-            self._base_cover = None
+            self._clear_cover()
+
+    def _clear_cover(self) -> None:
+        self._cover_frames = []
+        self._cover_key = None
+        self._cover_frame_idx = -1
+        self.disc_canvas.itemconfig(self._cover_image_item, image="")
 
     # --------- Closing
     def _on_close(self) -> None:
