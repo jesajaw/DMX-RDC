@@ -19,8 +19,11 @@ A small UI to control a DMX derby/laser fixture over a USB-DMX adapter — one s
 DMX-RDC/
 ├── main.py # entry point — run this
 ├── requirements.txt
-├── presets/    # created automatically, holds saved channel presets
+├── ...manual.pdf   # usermanual for the used DMX Derby Laser
+├── presets/    # created automatically, holds saved channel presets .json
+├── nowplaying_cache/    # just the cache for powershell
 └── src/
+    ├── __init__.py
     ├── config.py   # all constants live here
     ├── controller.py   # DMX serial link, preset persistence, platform helpers
     ├── musicmode.py    # audio analysis + Music Mode window
