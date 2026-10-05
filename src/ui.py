@@ -5,11 +5,13 @@ DMX Derby Controller
 Tkinter GUI to control a Razor Derby over a USB-DMX adapter
 (RS485, 250000 baud, 2 stop bits).
 
-Split across four files:
+Split across these files:
 - config.py:     central parameters class, single source of all constants
 - controller.py: DMX serial controller, preset persistence, platform helpers
 - musicmode.py:  audio analysis + Music Mode window
-- ui.py (this file): theme/color scheme, main window (DMXUI), dialogs
+- lightengine.py: tempo + song-structure engine and the simple "when -> do" looks of Music Mode
+- theme.py:       every ttk style (colours come from config.py)
+- ui.py (this file): main window (DMXUI), dialogs
 
 The entry point does NOT live here but in main.py at the project root --
 this file only provides DMXUI (and the dialog helpers), without starting a
@@ -31,8 +33,7 @@ import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk
 
-from . import config
-
+from . import config, theme
 from .controller import Controller, PresetManager, apply_dark_titlebar, force_dark_titlebar
 from .musicmode import MusicModeWindow
 
@@ -49,11 +50,13 @@ class DMXUI:
         self.channel_labels: dict[int, ttk.Label] = {}
         self.sliders: dict[int, ttk.Scale] = {}
         self.presets = PresetManager(config.PRESETS_DIR)
+        self._music_last: dict[int, int] = {}   # last value Music Mode wrote per channel
 
         self._setup_style()
-        self._build_connection_bar()
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+        self._build_header()
         self._build_channel_grid()
-        self._build_preset_bar()
         self._size_to_content()
 
         self._open_music_mode()
@@ -122,99 +125,112 @@ class DMXUI:
 
     # --------- theme
     def _setup_style(self) -> None:
-        style = ttk.Style()
-        style.theme_use("clam")
-
-        style.configure(".", background=config.COLOR_BG, foreground=config.COLOR_FG, font=("Segoe UI", 9))
-        style.configure("TFrame", background=config.COLOR_BG)
-        style.configure("TLabelframe", background=config.COLOR_BG, foreground=config.COLOR_FG, bordercolor=config.COLOR_DARK)
-        style.configure("TLabelframe.Label", background=config.COLOR_BG, foreground=config.COLOR)
-        style.configure("TLabel", background=config.COLOR_BG, foreground=config.COLOR_FG)
-
-        style.configure("TButton", background=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, bordercolor=config.COLOR_DARK, focusthickness=1, padding=6)
-        style.map("TButton", background=[("active", config.COLOR_DARK), ("pressed", config.COLOR)], foreground=[("active", config.COLOR_FG)])
-
-        style.configure("TCombobox", fieldbackground=config.COLOR_BG_LIGHT, background=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, arrowcolor=config.COLOR)
-        style.map("TCombobox", fieldbackground=[("readonly", config.COLOR_BG_LIGHT)])
-        # A combobox's popup listbox is a native Tk Listbox widget, not a ttk
-        # widget -- style.configure doesn't reach it, only option_add does
-        self.root.option_add("*TCombobox*Listbox.background", config.COLOR_BG_LIGHT)
-        self.root.option_add("*TCombobox*Listbox.foreground", config.COLOR_FG)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", config.COLOR_DARK)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", config.COLOR_FG)
-
-        style.configure("Horizontal.TScale", background=config.COLOR_BG, troughcolor=config.COLOR_BG_LIGHT)
-        style.configure("TEntry", fieldbackground=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, insertcolor=config.COLOR_FG)
-
-        style.configure("Blackout.TButton", background=config.COLOR_DARK, foreground=config.COLOR_FG)
-        style.map("Blackout.TButton", background=[("active", config.COLOR)])
-
-        style.configure("Cell.TFrame", background=config.COLOR_BG_LIGHT, bordercolor=config.COLOR_DARK)
-        style.configure("Status.TLabel", background=config.COLOR_BG_LIGHT, foreground=config.COLOR_STATUS_TEXT, font=("Consolas", 9))
-        style.configure("CellTitle.TLabel", background=config.COLOR_BG_LIGHT, foreground=config.COLOR_FG, font=("Segoe UI", 9, "bold"))
+        theme.apply_theme(self.root)
 
     # --------- UI
-    def _build_connection_bar(self) -> None:
-        bar = ttk.LabelFrame(self.root, text="Connection", padding=10)
-        bar.pack(fill="x", padx=10, pady=5)
+    GROUPS = (
+        ("Fixture", (1, 2)),
+        ("Derby  \u00b7  LED", (3, 4, 5)),
+        ("Laser", (6, 7, 8, 9)),
+    )
 
-        ttk.Label(bar, text="Port:").pack(side="left", padx=5)
+    def _build_header(self) -> None:
+        bar = ttk.Frame(self.root, padding=(18, 14, 18, 6))
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.columnconfigure(1, weight=1)
+
+        titles = ttk.Frame(bar)
+        titles.grid(row=0, column=0, sticky="w")
+        ttk.Label(titles, text="DMX DERBY CONTROLLER", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(titles, text="Varytec Razor Derby  \u00b7  9-channel mode", style="Subtitle.TLabel").pack(anchor="w")
+
+        controls = ttk.Frame(bar)
+        controls.grid(row=0, column=2, sticky="e")
+
+        self.conn_canvas = tk.Canvas(controls, width=14, height=14, bg=config.COLOR_BG, highlightthickness=0)
+        self.conn_canvas.pack(side="left")
+        self._conn_dot = self.conn_canvas.create_oval(2, 2, 12, 12, fill=config.ACTIVE_SCHEME["MUTED"], outline="")
+        self.conn_label = ttk.Label(controls, text="Disconnected", style="Muted.TLabel", width=16)
+        self.conn_label.pack(side="left", padx=(6, 14))
+
         ports = [p.device for p in serial.tools.list_ports.comports()] or ["COM3", "COM4"]
-        self.port_cb = ttk.Combobox(bar, values=ports, width=15, state="readonly")
-        self.port_cb.pack(side="left", padx=5)
+        self.port_cb = ttk.Combobox(controls, values=ports, width=12, state="readonly")
+        self.port_cb.pack(side="left", padx=(0, 8))
         self.port_cb.current(0)
 
-        self.btn_connect = ttk.Button(bar, text="Connect", command=self.toggle_connection)
-        self.btn_connect.pack(side="left", padx=5)
+        self.btn_connect = ttk.Button(controls, text="Connect", command=self.toggle_connection, style="Accent.TButton")
+        self.btn_connect.pack(side="left", padx=(0, 8))
+        ttk.Button(controls, text="BLACKOUT", command=self.blackout, style="Blackout.TButton").pack(side="left")
 
-        ttk.Button(bar, text="BLACKOUT", command=self.blackout,
-                   style="Blackout.TButton").pack(side="right", padx=5)
-        ttk.Button(bar, text="🎵 Music Mode", command=self._open_music_mode).pack(side="right", padx=5)
+    def _set_connection_state(self, connected: bool, port: str = "") -> None:
+        scheme = config.ACTIVE_SCHEME
+        self.conn_canvas.itemconfig(self._conn_dot, fill="#4cc38a" if connected else scheme["MUTED"])
+        self.conn_label.config(text=f"Connected  \u00b7  {port}" if connected else "Disconnected")
 
     def _build_channel_grid(self) -> None:
-        grid = ttk.LabelFrame(self.root, text="DMX Channels", padding=10)
-        grid.pack(fill="both", expand=True, padx=10, pady=5)
+        # Three columns (Fixture / Derby / Laser), channels stacked inside them. Everything stretches with
+        # the window; the free slots under Fixture and Derby hold the presets and the Music Mode entry.
+        grid = ttk.Frame(self.root, padding=(18, 8, 18, 18))
+        grid.grid(row=1, column=0, sticky="nsew")
+        for col in range(3):
+            grid.columnconfigure(col, weight=1, uniform="groups")
+        for row in range(1, 5):
+            grid.rowconfigure(row, weight=1, uniform="cells")
 
-        for i in range(config.CHANNEL_COUNT):
-            channel = i + 1
-            row, col = divmod(i, 3)
-            grid.columnconfigure(col, weight=1)
-            self._build_cell(grid, row, col, channel, config.CHANNEL_NAMES[i])
+        for col, (title, channels) in enumerate(self.GROUPS):
+            ttk.Label(grid, text=title.upper(), style="Subtitle.TLabel", font=(theme.FONT, 9, "bold"),
+                      foreground=config.ACTIVE_SCHEME["ACCENT2"]).grid(row=0, column=col, sticky="w",
+                                                                       padx=6, pady=(0, 6))
+            for i, channel in enumerate(channels):
+                self._build_cell(grid, i + 1, col, channel, config.CHANNEL_NAMES[channel - 1])
+
+        self._build_preset_card(grid, row=3, col=0, rowspan=2)
+        self._build_music_card(grid, row=4, col=1)
 
     def _build_cell(self, parent: ttk.Frame, row: int, col: int, channel: int, name: str) -> None:
-        cell = ttk.Frame(parent, padding=5, relief="groove", style="Cell.TFrame")
-        cell.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-        cell.pack_propagate(False)
-        cell.configure(width=config.CELL_WIDTH, height=config.CELL_HEIGHT)
+        cell = ttk.Frame(parent, padding=(14, 10), style="Card.TFrame")
+        cell.grid(row=row, column=col, padx=6, pady=5, sticky="nsew")
+        cell.columnconfigure(0, weight=1)
 
-        ttk.Label(cell, text=name, style="CellTitle.TLabel").pack(anchor="w")
-
-        status = ttk.Label(cell, text="---", style="Status.TLabel",
-                            width=config.STATUS_LABEL_CHARS, anchor="w")
-        status.pack(anchor="w", pady=(2, 5), fill="x")
+        ttk.Label(cell, text=name, style="CellTitle.TLabel").grid(row=0, column=0, sticky="w")
+        status = ttk.Label(cell, text="---", style="Status.TLabel", anchor="w")
+        status.grid(row=1, column=0, sticky="ew", pady=(2, 6))
         self.channel_labels[channel] = status
 
-        slider = ttk.Scale(cell, from_=0, to=255, orient="horizontal",
-                            command=lambda v, c=channel: self.on_slider_change(c, v))
+        slider = ttk.Scale(cell, from_=0, to=255, orient="horizontal", style="Card.Horizontal.TScale",
+                           command=lambda v, c=channel: self.on_slider_change(c, v))
         slider.set(0)
-        slider.pack(fill="x", expand=True)
+        slider.grid(row=2, column=0, sticky="ew")
         self.sliders[channel] = slider
 
         self.update_display(channel, 0)
 
-    def _build_preset_bar(self) -> None:
-        bar = ttk.LabelFrame(self.root, text="Presets", padding=10)
-        bar.pack(fill="x", padx=10, pady=5)
+    def _build_preset_card(self, parent: ttk.Frame, row: int, col: int, rowspan: int) -> None:
+        card = ttk.Frame(parent, padding=(14, 10), style="Card.TFrame")
+        card.grid(row=row, column=col, rowspan=rowspan, padx=6, pady=5, sticky="nsew")
+        card.columnconfigure(0, weight=1)
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(2, weight=1)
+        ttk.Label(card, text="PRESETS", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
 
-        self.preset_cb = ttk.Combobox(bar, values=self.presets.list_presets(),
-                                       width=20, state="readonly")
-        self.preset_cb.pack(side="left", padx=5)
+        self.preset_cb = ttk.Combobox(card, values=self.presets.list_presets(), state="readonly")
+        self.preset_cb.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 8))
         if self.preset_cb["values"]:
             self.preset_cb.current(0)
 
-        ttk.Button(bar, text="Load", command=self.load_preset).pack(side="left", padx=5)
-        ttk.Button(bar, text="Save As...", command=self.save_preset_as).pack(side="left", padx=5)
-        ttk.Button(bar, text="Delete", command=self.delete_preset).pack(side="left", padx=5)
+        ttk.Button(card, text="Load", command=self.load_preset).grid(row=2, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(card, text="Save As...", command=self.save_preset_as).grid(row=2, column=1, sticky="ew", padx=4)
+        ttk.Button(card, text="Delete", command=self.delete_preset).grid(row=2, column=2, sticky="ew", padx=(4, 0))
+
+    def _build_music_card(self, parent: ttk.Frame, row: int, col: int) -> None:
+        card = ttk.Frame(parent, padding=(14, 10), style="Card.TFrame")
+        card.grid(row=row, column=col, padx=6, pady=5, sticky="nsew")
+        card.columnconfigure(0, weight=1)
+        ttk.Label(card, text="MUSIC MODE", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, text="Lights that react to the music: bass hits, colour changes, strobe.",
+                  style="CardMuted.TLabel", wraplength=240, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 8))
+        ttk.Button(card, text="\U0001f3b5  Open Music Mode", command=self._open_music_mode,
+                   style="Accent.TButton").grid(row=2, column=0, sticky="ew")
 
     def _open_music_mode(self) -> None:
         channel_names = {ch: config.CHANNEL_NAMES[ch - 1] for ch in range(1, config.CHANNEL_COUNT + 1)}
@@ -225,6 +241,7 @@ class DMXUI:
             restore_sliders=self._music_restore_sliders,
             on_closed=self._on_music_mode_closed,
             colors=config.ACTIVE_SCHEME,
+            is_connected=lambda: self.dmx is not None,
         )
         window.update_idletasks()
         self.root.withdraw()
@@ -233,25 +250,36 @@ class DMXUI:
         self.root.deiconify()
 
     def _music_set_channel(self, channel: int, value: int) -> None:
+        # Music Mode drives the channel. The value goes straight to the DMX buffer -- it must not depend on the
+        # slider accepting a programmatic set() while it is disabled. The slider only mirrors the value.
         slider = self.sliders.get(channel)
         if slider is None:
             return
-        if str(slider.cget("state")) != "disabled":
-            slider.state(["disabled"])
-        slider.set(value)  # triggers on_slider_change -> display + dmx.set_channel
+        value = int(value)
+        if self.dmx:
+            self.dmx.set_channel(channel, value)
+        if self._music_last.get(channel) == value:
+            return                                   # nothing new for the display
+        self._music_last[channel] = value
+        self.update_display(channel, value)
+        slider.state(["!disabled"])                  # a disabled ttk.Scale may ignore set()
+        slider.set(value)                            # -> on_slider_change (display + dmx, same value)
+        slider.state(["disabled"])                   # locked while Music Mode owns the channel
 
     def _music_restore_sliders(self, channels: list[int]) -> None:
         for channel in channels:
+            self._music_last.pop(channel, None)
             slider = self.sliders.get(channel)
             if slider is not None:
                 slider.state(["!disabled"])
 
     def _size_to_content(self) -> None:
+        # the content decides the minimum size; the window can grow from there and everything scales with it
         self.root.update_idletasks()
         width = self.root.winfo_reqwidth()
         height = self.root.winfo_reqheight()
-        self.root.geometry(f"{width}x{height}")
         self.root.minsize(width, height)
+        self.root.geometry(f"{max(width, 1020)}x{max(height, 640)}")
 
     # --------- Sliders
     def update_display(self, channel: int, value) -> None:
@@ -274,6 +302,7 @@ class DMXUI:
         else:
             self.stop_dmx()
             self.btn_connect.config(text="Connect")
+            self._set_connection_state(False)
 
     def _connect_worker(self, port: str) -> None:
         try:
@@ -289,6 +318,7 @@ class DMXUI:
         self.is_sending = True
         threading.Thread(target=self._send_loop, daemon=True).start()
         self.btn_connect.config(text="Disconnect", state="normal")
+        self._set_connection_state(True, self.port_cb.get())
 
     def _connect_failed(self, error: Exception, port: str) -> None:
         self.btn_connect.config(state="normal")
@@ -298,6 +328,7 @@ class DMXUI:
         self.is_sending = False
         self.dmx = None
         self.btn_connect.config(text="Connect", state="normal")
+        self._set_connection_state(False)
         show_error(self.root, "Connection Lost", f"DMX connection interrupted:\n{error}")
 
     def _send_loop(self) -> None:

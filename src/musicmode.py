@@ -4,8 +4,8 @@ Music Mode
 
 A standalone window (MusicModeWindow) that analyzes the system's audio
 output (loopback of the current playback device) in real time, visualizes it
-as a spectrum + oscilloscope, can map Bass/Mid/Treble/Beat/Pitch onto DMX
-channels, and optionally shows the title/artist/cover art of the track
+as a spectrum ring/bars around the cover + oscilloscope, drives the DMX channels from it through the
+LightEngine (lightengine.py: tempo / beat grid / song sections, simple "when -> do" looks) and optionally shows the title/artist/cover art of the track
 currently playing.
 
 The main window (DMXUI) is hidden while this is open (root.withdraw()) and
@@ -97,8 +97,9 @@ from tkinter import ttk
 import numpy as np
 
 from . import config
-
+from . import lightengine, theme
 from .controller import apply_dark_titlebar
+from .lightengine import BREAK, BUILD, DROP, SECTION_LABELS, SILENCE, LightEngine
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -149,17 +150,27 @@ class AudioFrame:
     bars: np.ndarray = None
     waveform: np.ndarray = None
     error: Exception = None
+    # Rhythm / structure features, consumed by the LightEngine (lightengine.py)
+    dt: float = 0.0                  # seconds of audio this frame covers
+    kick_hit: bool = False           # a kick onset was detected in this block (the trigger behind `beat`)
+    flux_low: float = 0.0            # onset strength in the kick/bass region (log-compressed spectral flux)
+    flux_high: float = 0.0           # the same for the hi-hat region
+    bass_db: float = -120.0          # raw band levels in dB (before auto-gain), used for song-structure detection
+    mid_db: float = -120.0
+    treble_db: float = -120.0
+    total_db: float = -120.0
 
 
 class AudioAnalyzer:
     """Captures system loopback audio and computes several live metrics from it:
     - bass/mid/treble: smoothed energy in three frequency bands (0..1)
-    - beat: a short, decaying pulse on sudden energy spikes
-      (simple onset detection, not real BPM tracking)
+    - beat: a short, decaying pulse on sudden energy spikes (simple onset detection;
+      BPM tracking is done on top of this by the LightEngine, from the flux values below)
     - pitch: normalized spectral centroid (0 = dull/bassy, 1 = bright/high-frequency) --
       better suited to continuous rotation/speed parameters than a plain band energy
     - bars: spectrum split into log-spaced bands, for the bar display
     - waveform: a short slice of the raw samples, for the oscilloscope display
+    - dt / kick_hit / flux_low / flux_high / *_db: raw rhythm and level features for the LightEngine
 
     On Windows, uses PyAudioWPatch (a dedicated WASAPI-loopback fork of
     PyAudio). On Linux, uses plain PyAudio against the PulseAudio/PipeWire
@@ -194,6 +205,7 @@ class AudioAnalyzer:
         self._pitch_hi = 0.6
         self._band_ref = {name: -120.0 for name in config.BAND_RANGES}  # loudest recent dB per band (auto-gain)
         self._bars_ref = -120.0
+        self._prev_lm = None                # previous log-magnitude spectrum, for the spectral flux
         self._layout_sr = None              # sample rate the FFT index tables below were built for
         self._buf = None
         self._error_logged = False
@@ -305,6 +317,10 @@ class AudioAnalyzer:
 
         self._band_idx = {name: bins(lo, hi) for name, (lo, hi) in config.BAND_RANGES.items()}
         self._kick_idx = bins(*config.BEAT_BAND)
+        self._flux_low_idx = bins(*config.FLUX_LOW_BAND)
+        self._flux_high_idx = bins(*config.FLUX_HIGH_BAND)
+        self._total_idx = bins(20, config.BAR_FREQ_RANGE[1])
+        self._prev_lm = None
         edges = self._bar_edges
         self._bar_idx = [bins(edges[i], edges[i + 1]) for i in range(self.n_bars)]
         centers = np.sqrt(edges[:-1] * edges[1:])
@@ -337,8 +353,10 @@ class AudioAnalyzer:
         gamma = 1.0 / max(self.gain, 0.05)         # sensitivity: >1 lifts quiet parts, <1 suppresses them
 
         # --- bass/mid/treble: band RMS in dB, each band normalised to its own recent peak
+        band_db = {}
         for name, idx in self._band_idx.items():
             db = 10.0 * math.log10(float(power[idx].sum()) + 1e-12)
+            band_db[name] = db
             ref = max(db, self._band_ref[name] - decay)
             self._band_ref[name] = ref
             level = self._norm(db, max(ref, config.AGC_MIN_REF_BAND_DB), config.DB_RANGE_BAND) ** gamma
@@ -386,6 +404,17 @@ class AudioAnalyzer:
             s = max(self.smoothing, config.PITCH_SMOOTHING_MIN)
             self._pitch_level = s * self._pitch_level + (1 - s) * target
 
+        # --- raw rhythm features for the LightEngine: positive spectral flux (log-compressed magnitudes)
+        lm = np.log1p(config.FLUX_LOG_COMPRESSION * mag)
+        if self._prev_lm is None:
+            flux_low = flux_high = 0.0
+        else:
+            rise = np.maximum(lm - self._prev_lm, 0.0)
+            flux_low = float(rise[self._flux_low_idx].sum())
+            flux_high = float(rise[self._flux_high_idx].sum())
+        self._prev_lm = lm
+        total_db = 10.0 * math.log10(float(power[self._total_idx].sum()) + 1e-12)
+
         step = max(1, n // config.WAVE_POINTS)
         waveform = np.clip(samples[::step], -1.0, 1.0)
 
@@ -393,6 +422,8 @@ class AudioAnalyzer:
             bass=self._levels["bass"], mid=self._levels["mid"], treble=self._levels["treble"],
             beat=self._beat_level, pitch=self._pitch_level,
             bars=self._bar_levels.copy(), waveform=waveform,
+            dt=n / self.samplerate, kick_hit=bool(onset), flux_low=flux_low, flux_high=flux_high,
+            bass_db=band_db["bass"], mid_db=band_db["mid"], treble_db=band_db["treble"], total_db=total_db,
         ))
 
 
@@ -676,107 +707,166 @@ class NowPlayingReader:
 
 
 class MusicModeWindow(tk.Toplevel):
-    """Standalone window: spectrum + oscilloscope side by side, a disc with
-    title/artist below, channel mapping, and start/stop settings."""
+    """Music Mode window. Left: the cover disc with the spectrum around it (ring or bars) and the waveform.
+    Right: what the lights do -- a few simple rules ("on every bass hit -> LED blinks + strobe"), two colours
+    to switch between, and a handful of sliders.
+
+    Channel 1 (show select) is written once with 0 when the window opens and is never touched again, so the
+    fixture stays in per-channel mode whatever is set here."""
 
     def __init__(self, parent: tk.Tk, channel_names: dict, set_channel_value,
-                 restore_sliders, on_closed, colors: dict):
+                 restore_sliders, on_closed, colors: dict, is_connected=None):
         """
         channel_names:     {channel_nr: "1: Show Select", ...}
         set_channel_value: callback(channel: int, value: int) -> None
         restore_sliders:   callback(channels: list[int]) -> None
         on_closed:         callback() -> None, called when this window closes
                             (the main window should show itself again then)
-        colors:             dict with BG/BG_LIGHT/FG/ACCENT/ACCENT_DARK/STATUS_TEXT
-                            (same shape as config.ACTIVE_SCHEME)
+        colors:             dict with the keys of config.ACTIVE_SCHEME
+        is_connected:       optional callback() -> bool, whether the DMX adapter is connected (status line)
         """
         super().__init__(parent)
         self.title("Music Mode")
         self.colors = colors
         apply_dark_titlebar(self)
         self.configure(bg=colors["BG"])
-        self.resizable(False, False)
+        theme.apply_theme(self)
 
         self.channel_names = channel_names
         self.set_channel_value = set_channel_value
         self.restore_sliders = restore_sliders
         self.on_closed = on_closed
+        self.is_connected = is_connected
 
         self.analyzer = AudioAnalyzer(on_frame=self._on_frame)
         self.now_playing = None
-        self.mapping_vars = {}
-        self.meters = {}
+        self.look = lightengine.DEFAULT.copy()
+        self.engine = LightEngine(self.look)
+        self.rule_vars = {}              # (trigger, action) -> BooleanVar
+        self._loading = False            # True while a look is written into the widgets
+        self._status_cache = {}
         self._active_channels = set()
-        self._bar_ids = []
+        self._last_bars = None
+        self._peaks = [0.0] * config.N_BARS
+        self._pulse = 0.0
+        self._wave_w = config.VIZ_MIN_SIZE
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # the window is as big as its content needs, but can grow (and everything scales with it)
+        self.update_idletasks()
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width = min(self.winfo_reqwidth(), screen_w - 40)
+        height = min(self.winfo_reqheight(), screen_h - 90)
+        self.minsize(width, height)
+        self.geometry(f"{max(width, 1240)}x{height}")
+
+        self._release_manual_channel()
         self.analyzer.start()
 
+    def _release_manual_channel(self) -> None:
+        """Channel 1 = 0 (per-channel control) once, then hands off for good."""
+        self.set_channel_value(1, 0)
+        self.restore_sliders([1])
+
     # --------- Layout
-    def _init_styles(self) -> None:
-        colors = self.colors
-        style = ttk.Style(self)
-        style.configure("Meter.Horizontal.TProgressbar",
-                        troughcolor=colors["BG_LIGHT"], background=colors["ACCENT"],
-                        bordercolor=colors["BG_LIGHT"], lightcolor=colors["ACCENT"],
-                        darkcolor=colors["ACCENT"], thickness=10)
-
     def _build(self) -> None:
-        # Two-column dashboard: [ disc | visualizer ] on top, [ mapping | settings ] below.
-        self._init_styles()
-        self.columnconfigure(0, weight=0)
-        self.columnconfigure(1, weight=1)
+        colors = self.colors
+        self.columnconfigure(0, weight=3, minsize=480)
+        self.columnconfigure(1, weight=2, minsize=500)
+        self.rowconfigure(0, weight=1)
 
-        now = ttk.LabelFrame(self, text="Now Playing", padding=12)
-        now.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=(12, 6))
-        self._build_disc(now)
+        left = ttk.Frame(self)
+        left.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=(16, 8))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        self._build_visual(left)
 
-        viz = ttk.LabelFrame(self, text="Visualizer", padding=12)
-        viz.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=(12, 6))
-        self._build_plots(viz)
-
-        bottom = ttk.Frame(self)
-        bottom.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=6)
-        bottom.columnconfigure(0, weight=3, uniform="bottom")
-        bottom.columnconfigure(1, weight=2, uniform="bottom")
-        self._build_mapping(bottom)
-        self._build_settings(bottom)
+        right = ttk.Frame(self)
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(16, 8))
+        right.columnconfigure(0, weight=1)
+        self._build_live(right, 0)
+        self._build_looks(right, 1)
+        self._build_rules(right, 2)
+        self._build_colours(right, 3)
+        self._build_tuning(right, 4)
+        self._load_look(self.look.name)
 
         footer = ttk.Frame(self)
-        footer.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(6, 12))
+        footer.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 16))
+        self.dmx_label = ttk.Label(footer, text="", style="Muted.TLabel")
+        self.dmx_label.pack(side="left", padx=(0, 18))
         self.status_label = ttk.Label(footer, text="", foreground="#c0392b")
         self.status_label.pack(side="left")
         ttk.Button(footer, text="Back to Manual Control", command=self._on_close).pack(side="right")
+        self.blackout_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(footer, text="\u23fb  Blackout", style="Chip.Toolbutton", variable=self.blackout_var,
+                        command=self._on_blackout).pack(side="right", padx=(0, 10))
 
-    def _build_disc(self, parent: ttk.Frame) -> None:
+    def _card(self, parent, title: str, row: int, pady=(0, 10)) -> ttk.Frame:
+        outer = ttk.Frame(parent, style="Card.TFrame", padding=(14, 10))
+        outer.grid(row=row, column=0, sticky="ew", pady=pady)
+        outer.columnconfigure(0, weight=1)
+        ttk.Label(outer, text=title.upper(), style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        body = ttk.Frame(outer, style="Plain.Card.TFrame")
+        body.grid(row=1, column=0, sticky="ew")
+        return body
+
+    # --------- Left side: now playing + spectrum around the cover + waveform
+    def _build_visual(self, parent: ttk.Frame) -> None:
         colors = self.colors
-        size = config.DISC_SIZE
-        self.disc_canvas = tk.Canvas(parent, width=size, height=size,
-                                      bg=colors["BG"], highlightthickness=0)
-        self.disc_canvas.pack()
+        head = ttk.Frame(parent)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        head.columnconfigure(0, weight=1)
+        titles = ttk.Frame(head)
+        titles.grid(row=0, column=0, sticky="w")
+        self.track_label = ttk.Label(titles, text="", style="Track.TLabel", wraplength=480)
+        self.track_label.pack(anchor="w")
+        self.artist_label = ttk.Label(titles, text="", style="Artist.TLabel", wraplength=480)
+        self.artist_label.pack(anchor="w")
+        modes = ttk.Frame(head)
+        modes.grid(row=0, column=1, sticky="e")
+        self.viz_mode = tk.StringVar(value="ring")
+        for value, text in (("ring", "Ring"), ("bars", "Bars")):
+            ttk.Radiobutton(modes, text=text, value=value, variable=self.viz_mode, style="Chip.Toolbutton",
+                            command=self._layout_viz).pack(side="left", padx=(6, 0))
 
-        cx = cy = size / 2
-        self.disc_canvas.create_oval(4, 4, size - 4, size - 4,
-                                      outline=colors["ACCENT_DARK"], width=2)
-        for r in range(int(size / 2) - 8, 24, -12):
-            self.disc_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                          outline=colors["ACCENT_DARK"], width=1)
+        size = config.VIZ_MIN_SIZE
+        self.disc_canvas = tk.Canvas(parent, width=size, height=size, bg=colors["BG_LIGHT"],
+                                     highlightthickness=1, highlightbackground=colors["LINE"])
+        self.disc_canvas.grid(row=1, column=0, sticky="nsew")
+        canvas = self.disc_canvas
 
-        # Small rotating pixel-art dots as a fallback "label" while no real
-        # cover art is available (see module docstring)
+        # spectrum lines: created first so the disc is drawn on top. 2*N slots (ring is mirrored left/right);
+        # bars mode only uses the first N.
+        n = config.N_BARS
+        self._slots = 2 * n
+        self._bar_ids, self._peak_ids = [], []
+        for k in range(self._slots):
+            idx = k if k < n else self._slots - 1 - k
+            colour = theme.lerp_colour(colors["ACCENT"], colors["ACCENT2"], idx / max(1, n - 1))
+            self._bar_ids.append(canvas.create_line(0, 0, 0, 0, fill=colour, width=3, capstyle="butt"))
+            self._peak_ids.append(canvas.create_line(0, 0, 0, 0, fill=colors["FG"], width=3, capstyle="butt"))
+        self._dirs = [(math.sin((k + 0.5) * 2 * math.pi / self._slots),
+                       math.cos((k + 0.5) * 2 * math.pi / self._slots)) for k in range(self._slots)]
+
+        # the disc: rings, rotating pixel dots (fallback while there is no cover), centre dot, cover on top
+        r_disc = config.DISC_SIZE / 2
+        self._disc_radii = [r_disc - 4] + list(range(int(r_disc) - 8, 24, -12))
+        self._ring_ovals = []
+        for i, radius in enumerate(self._disc_radii):
+            self._ring_ovals.append(canvas.create_oval(0, 0, 0, 0, outline=colors["ACCENT_DARK"],
+                                                       width=2 if i == 0 else 1))
         self._pixel_ids = []
         for i in range(config.PIXEL_DOT_COUNT):
-            color = colors["ACCENT"] if i % 2 == 0 else colors["ACCENT_DARK"]
-            dot_id = self.disc_canvas.create_rectangle(0, 0, 0, 0, fill=color, outline="")
-            self._pixel_ids.append(dot_id)
-        self.disc_canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
-                                      fill=colors["FG"], outline="")
+            colour = colors["ACCENT"] if i % 2 == 0 else colors["ACCENT_DARK"]
+            self._pixel_ids.append(canvas.create_rectangle(0, 0, 0, 0, fill=colour, outline=""))
+        self._center_dot = canvas.create_oval(0, 0, 0, 0, fill=colors["FG"], outline="")
 
-        # The cover image sits last in the draw order -> automatically covers
-        # the pixel dots once a cover is actually set (image=None draws nothing)
-        self._cover_image_item = self.disc_canvas.create_image(cx, cy, image=None)
+        # The cover image sits last in the draw order -> automatically covers the pixel dots once a cover
+        # is actually set (image=None draws nothing)
+        self._cover_image_item = canvas.create_image(size / 2, size / 2, image=None)
         self._cover_photo = None   # keep a reference, or Tkinter garbage-collects the image
         self._cover_frames = []    # pre-rotated PhotoImages, built once per cover (main thread only)
         self._cover_key = None     # identifies the cover the frames were built from
@@ -784,12 +874,16 @@ class MusicModeWindow(tk.Toplevel):
         self._disc_angle = 0.0
         self._playing = True       # disc only spins while music is playing
 
-        self.track_label = ttk.Label(parent, text="", font=("Segoe UI", 11, "bold"),
-                                      wraplength=size + 20, justify="center")
-        self.track_label.pack(pady=(10, 0))
-        self.artist_label = ttk.Label(parent, text="", foreground=colors["STATUS_TEXT"],
-                                       wraplength=size + 20, justify="center")
-        self.artist_label.pack()
+        self._geo = {}
+        canvas.bind("<Configure>", lambda e: self._layout_viz())
+
+        self.wave_canvas = tk.Canvas(parent, height=config.WAVE_CANVAS_HEIGHT, bg=colors["BG_LIGHT"],
+                                     highlightthickness=1, highlightbackground=colors["LINE"])
+        self.wave_canvas.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._wave_glow = self.wave_canvas.create_line(0, 0, 0, 0, fill=colors["ACCENT_DARK"], width=5, smooth=True)
+        self._wave_line = self.wave_canvas.create_line(0, 0, 0, 0, fill=colors["ACCENT2"], width=1.5, smooth=True)
+        self._wave_mid = self.wave_canvas.create_line(0, 0, 0, 0, fill=colors["LINE"])
+        self.wave_canvas.bind("<Configure>", self._on_wave_resize)
 
         have_now_playing_source = (config.NOWPLAYING_BRIDGE_EXE.exists()
                                     or config.NOWPLAYING_BRIDGE_SCRIPT.exists()
@@ -801,14 +895,65 @@ class MusicModeWindow(tk.Toplevel):
                                              on_playing=self._on_playing)
             self.now_playing.start()
 
+        self._layout_viz()
         self._spin_disc()
+
+    def _on_wave_resize(self, event) -> None:
+        self._wave_w = max(10, event.width)
+        mid = event.height / 2
+        self.wave_canvas.coords(self._wave_mid, 0, mid, self._wave_w, mid)
+
+    def _layout_viz(self) -> None:
+        """(Re)computes the geometry of the disc and the spectrum for the current canvas size and mode."""
+        canvas = self.disc_canvas
+        w, h = canvas.winfo_width(), canvas.winfo_height()
+        if w < 60 or h < 60:
+            w = h = config.VIZ_MIN_SIZE
+        r_disc = config.DISC_SIZE / 2
+        ring = self.viz_mode.get() == "ring"
+        n = config.N_BARS
+        if ring:
+            cx, cy = w / 2, h / 2
+            r_in = r_disc + config.RING_GAP
+            max_len = max(18.0, min(w, h) / 2 - r_in - 12)
+            width = max(2.0, 2 * math.pi * (r_in + 8) / self._slots * 0.55)
+            geo = dict(ring=True, cx=cx, cy=cy, r_in=r_in, max_len=max_len)
+        else:
+            bars_h = max(100.0, h * 0.32)
+            cx, cy = w / 2, max(r_disc + 10, (h - bars_h) / 2)
+            slot = max(2.0, (w - 28) / n)
+            width = max(2.0, slot * 0.68)
+            geo = dict(ring=False, cx=cx, cy=cy, base_y=h - 10, max_len=max(20.0, bars_h - 24),
+                       x0=14, slot=slot)
+        self._geo = geo
+
+        for item, radius in zip(self._ring_ovals, self._disc_radii):
+            canvas.coords(item, cx - radius, cy - radius, cx + radius, cy + radius)
+        canvas.coords(self._center_dot, cx - 5, cy - 5, cx + 5, cy + 5)
+        canvas.coords(self._cover_image_item, cx, cy)
+        for k in range(self._slots):
+            visible = ring or k < n
+            state = "normal" if visible else "hidden"
+            canvas.itemconfig(self._bar_ids[k], width=width, state=state)
+            canvas.itemconfig(self._peak_ids[k], width=width, state=state)
+
+        # bars mode: LED-style segments (thin lines in the canvas colour across the bars)
+        canvas.delete("seg")
+        if not ring:
+            y = geo["base_y"]
+            while y > geo["base_y"] - geo["max_len"] - 6:
+                canvas.create_line(0, y, w, y, fill=self.colors["BG_LIGHT"], width=2, tags="seg")
+                y -= 6
+            canvas.tag_lower("seg", self._ring_ovals[0])
+        if self._last_bars is not None:
+            self._draw_bars()
 
     def _spin_disc(self) -> None:
         if not self.winfo_exists():
             return
         if self._playing:
             self._disc_angle = (self._disc_angle + config.SPIN_STEP_DEG) % 360
-        cx = cy = config.DISC_SIZE / 2
+        cx, cy = self._geo.get("cx", config.VIZ_MIN_SIZE / 2), self._geo.get("cy", config.VIZ_MIN_SIZE / 2)
         count = len(self._pixel_ids)
         for i, dot_id in enumerate(self._pixel_ids):
             angle = math.radians(self._disc_angle + i * (360 / count))
@@ -825,99 +970,232 @@ class MusicModeWindow(tk.Toplevel):
 
         self.after(config.SPIN_INTERVAL_MS, self._spin_disc)
 
-    def _build_plots(self, parent: ttk.Frame) -> None:
+    # --------- Right side: live status
+    def _build_live(self, parent: ttk.Frame, row: int) -> None:
+        box = self._card(parent, "Live", row)
+        box.columnconfigure(0, weight=1)
         colors = self.colors
-        bar_w, bar_h = config.BAR_CANVAS_WIDTH, config.BAR_CANVAS_HEIGHT
-        wave_w, wave_h = config.WAVE_CANVAS_WIDTH, config.WAVE_CANVAS_HEIGHT
-        header_font = ("Segoe UI", 9, "bold")
 
-        ttk.Label(parent, text="Spectrum", font=header_font).pack(anchor="w")
-        self.bar_canvas = tk.Canvas(parent, width=bar_w, height=bar_h,
-                                     bg=colors["BG_LIGHT"], highlightthickness=0)
-        self.bar_canvas.pack(pady=(3, 10))
-        for frac in (0.25, 0.5, 0.75):   # faint guide lines behind the bars
-            self.bar_canvas.create_line(0, bar_h * frac, bar_w, bar_h * frac, fill=colors["BG"])
-        self._peaks = [0.0] * config.N_BARS
-        self._peak_ids = []
-        for _ in range(config.N_BARS):
-            self._bar_ids.append(self.bar_canvas.create_rectangle(
-                0, bar_h, 0, bar_h, fill=colors["ACCENT"], width=0))
-            self._peak_ids.append(self.bar_canvas.create_rectangle(
-                0, bar_h, 0, bar_h, fill=colors["STATUS_TEXT"], width=0))
+        self.bpm_label = ttk.Label(box, text="-- BPM", style="Big.TLabel")
+        self.bpm_label.grid(row=0, column=0, sticky="w")
+        self.lock_label = ttk.Label(box, text="listening...", style="Hint.TLabel")
+        self.lock_label.grid(row=1, column=0, sticky="w")
+        self.section_label = ttk.Label(box, text="", style="Section.TLabel")
+        self.section_label.grid(row=0, column=1, rowspan=2, sticky="e")
 
-        ttk.Label(parent, text="Waveform", font=header_font).pack(anchor="w")
-        self.wave_canvas = tk.Canvas(parent, width=wave_w, height=wave_h,
-                                      bg=colors["BG_LIGHT"], highlightthickness=0)
-        self.wave_canvas.pack(pady=(3, 0))
-        mid_y = wave_h / 2
-        self.wave_canvas.create_line(0, mid_y, wave_w, mid_y, fill=colors["BG"])
-        self._wave_line = self.wave_canvas.create_line(
-            0, mid_y, wave_w, mid_y, fill=colors["ACCENT"], width=1.5, smooth=True)
+        self.beat_canvas = tk.Canvas(box, width=150, height=22, bg=colors["BG_LIGHT"], highlightthickness=0)
+        self.beat_canvas.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self._beat_dots = [self.beat_canvas.create_oval(4 + i * 36, 3, 24 + i * 36, 21,
+                                                        outline=colors["ACCENT_DARK"], width=2) for i in range(4)]
+        self.bar_label = ttk.Label(box, text="", style="Hint.TLabel")
+        self.bar_label.grid(row=2, column=1, sticky="e", pady=(10, 0))
 
-    def _build_mapping(self, parent: ttk.Frame) -> None:
-        mapping = ttk.LabelFrame(parent, text="Channel Mapping", padding=12)
-        mapping.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        mapping.columnconfigure(2, weight=1)
+        # what the fixture is being told right now
+        self.preview_canvas = tk.Canvas(box, width=360, height=26, bg=colors["BG_LIGHT"], highlightthickness=0)
+        self.preview_canvas.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self._preview_dots, self._preview_state = {}, None
+        for i, (key, text) in enumerate((("bass", "BASS"), ("led", "LED"), ("laser", "LASER"), ("strobe", "STROBE"))):
+            x = 6 + i * 90
+            dot = self.preview_canvas.create_oval(x, 5, x + 16, 21, outline=colors["LINE"], width=2)
+            self.preview_canvas.create_text(x + 24, 13, text=text, anchor="w", fill=colors["MUTED"],
+                                            font=(theme.FONT, 8, "bold"))
+            self._preview_dots[key] = dot
 
-        options = ["None"] + [self.channel_names[c] for c in sorted(self.channel_names)]
-        for row, source in enumerate(config.SOURCES):
-            ttk.Label(mapping, text=config.SOURCE_LABELS[source], width=8).grid(
-                row=row, column=0, sticky="w", pady=4)
+        self.build_bar = ttk.Progressbar(box, orient="horizontal", maximum=100, style="Build.Horizontal.TProgressbar")
+        self.build_bar.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
-            var = tk.StringVar(value="None")
-            self.mapping_vars[source] = var
-            cb = ttk.Combobox(mapping, values=options, textvariable=var, width=24, state="readonly")
-            cb.grid(row=row, column=1, padx=10, pady=4)
+    # --------- Right side: quick looks
+    def _build_looks(self, parent: ttk.Frame, row: int) -> None:
+        box = self._card(parent, "Look", row)
+        self.look_var = tk.StringVar(value=self.look.name)
+        buttons = ttk.Frame(box, style="Plain.Card.TFrame")
+        buttons.grid(row=0, column=0, sticky="ew")
+        for i, look in enumerate(lightengine.QUICK_LOOKS):
+            buttons.columnconfigure(i % 3, weight=1, uniform="looks")
+            ttk.Radiobutton(buttons, text=look.name, value=look.name, variable=self.look_var,
+                            style="Look.Toolbutton", command=lambda n=look.name: self._load_look(n)
+                            ).grid(row=i // 3, column=i % 3, sticky="ew", padx=2, pady=2)
+        self.look_desc = ttk.Label(box, text="", style="Hint.TLabel", wraplength=470, justify="left")
+        self.look_desc.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-            meter = ttk.Progressbar(mapping, orient="horizontal", maximum=100,
-                                    style="Meter.Horizontal.TProgressbar")
-            meter.grid(row=row, column=2, sticky="ew", pady=4)
-            self.meters[source] = meter
+    # --------- Right side: the rules
+    def _build_rules(self, parent: ttk.Frame, row: int) -> None:
+        box = self._card(parent, "When this happens  \u2192  do this", row)
+        chips = {"led": "LED", "laser": "Laser", "strobe": "Strobe", "blackout": "Blackout", "colour": "Colour \u21c4"}
+        self.every_var = tk.StringVar()
+        for r, (trigger, text) in enumerate(lightengine.TRIGGERS):
+            cell = ttk.Frame(box, style="Plain.Card.TFrame")
+            cell.grid(row=r, column=0, sticky="w", pady=3)
+            if trigger == "beat":
+                ttk.Label(cell, text="Every", style="Card.TLabel").pack(side="left")
+                cb = ttk.Combobox(cell, values=list(lightengine.BEAT_OPTIONS), textvariable=self.every_var,
+                                  state="readonly", width=8)
+                cb.pack(side="left", padx=(6, 0))
+                cb.bind("<<ComboboxSelected>>", lambda e: self._on_every_change())
+            else:
+                ttk.Label(cell, text=text, style="Card.TLabel", width=14).pack(side="left")
+            box.columnconfigure(1, weight=1)
+            bar = ttk.Frame(box, style="Plain.Card.TFrame")
+            bar.grid(row=r, column=1, sticky="e", pady=3, padx=(10, 0))
+            for action, _label in lightengine.ACTIONS:
+                var = tk.BooleanVar(value=False)
+                self.rule_vars[(trigger, action)] = var
+                ttk.Checkbutton(bar, text=chips[action], variable=var, style="Chip.Toolbutton",
+                                command=self._on_rule_change).pack(side="left", padx=2)
 
-    def _build_settings(self, parent: ttk.Frame) -> None:
-        settings = ttk.LabelFrame(parent, text="Settings", padding=12)
-        settings.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        settings.columnconfigure(0, weight=1)
+    # --------- Right side: colours, pattern, base light
+    def _build_colours(self, parent: ttk.Frame, row: int) -> None:
+        box = self._card(parent, "Colours", row)
+        box.columnconfigure(1, weight=1)
+        self._colour_vars, self._swatches = {}, {}
+        led_labels = [label for label, _ in lightengine.LED_COLOURS.values()]
+        laser_labels = [label for label, _ in lightengine.LASER_COLOURS.values()]
+        for r, (title, attrs, labels, table) in enumerate((
+                ("LED", ("led_a", "led_b"), led_labels, lightengine.LED_COLOURS),
+                ("Laser", ("laser_a", "laser_b"), laser_labels, lightengine.LASER_COLOURS))):
+            ttk.Label(box, text=title, style="Card.TLabel", width=8).grid(row=r, column=0, sticky="w", pady=3)
+            line = ttk.Frame(box, style="Plain.Card.TFrame")
+            line.grid(row=r, column=1, sticky="w", pady=3)
+            for j, attr in enumerate(attrs):
+                if j == 1:
+                    ttk.Label(line, text="\u21c4", style="CardMuted.TLabel").pack(side="left", padx=8)
+                swatch = tk.Label(line, text="  ", bg=self.colors["LINE"], width=2)
+                swatch.pack(side="left", padx=(0, 6))
+                var = tk.StringVar()
+                cb = ttk.Combobox(line, values=labels, textvariable=var, state="readonly", width=14)
+                cb.pack(side="left")
+                cb.bind("<<ComboboxSelected>>", lambda e, a=attr, t=table: self._on_colour_change(a, t))
+                self._colour_vars[attr] = var
+                self._swatches[attr] = swatch
 
-        head = ttk.Frame(settings)
-        head.grid(row=0, column=0, sticky="ew")
-        ttk.Label(head, text="Sensitivity").pack(side="left")
-        self.gain_value = ttk.Label(head, text="", foreground=self.colors["STATUS_TEXT"])
-        self.gain_value.pack(side="right")
-        self.gain_scale = ttk.Scale(settings, from_=0.2, to=5.0, orient="horizontal",
-                                     command=self._on_gain_change)
-        self.gain_scale.set(self.analyzer.gain)
-        self.gain_scale.grid(row=1, column=0, sticky="ew", pady=(2, 14))
+        ttk.Label(box, text="Laser pattern", style="Card.TLabel", width=12).grid(row=2, column=0, sticky="w", pady=3)
+        self.pattern_var = tk.StringVar()
+        cb = ttk.Combobox(box, values=["Auto (cycle)"] + [f"Pattern {i}" for i in range(1, 19)],
+                          textvariable=self.pattern_var, state="readonly", width=14)
+        cb.grid(row=2, column=1, sticky="w", pady=3)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._on_pattern_change())
 
-        head = ttk.Frame(settings)
-        head.grid(row=2, column=0, sticky="ew")
-        ttk.Label(head, text="Smoothing").pack(side="left")
-        self.smooth_value = ttk.Label(head, text="", foreground=self.colors["STATUS_TEXT"])
-        self.smooth_value.pack(side="right")
-        self.smooth_scale = ttk.Scale(settings, from_=0.0, to=0.95, orient="horizontal",
-                                       command=self._on_smoothing_change)
-        self.smooth_scale.set(self.analyzer.smoothing)
-        self.smooth_scale.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+        base = ttk.Frame(box, style="Plain.Card.TFrame")
+        base.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.base_led_var = tk.BooleanVar(value=False)
+        self.base_laser_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(base, text="LED always on", variable=self.base_led_var, style="Card.TCheckbutton",
+                        command=self._on_base_change).pack(side="left", padx=(0, 18))
+        ttk.Checkbutton(base, text="Laser always on", variable=self.base_laser_var, style="Card.TCheckbutton",
+                        command=self._on_base_change).pack(side="left")
 
-    def _channel_for(self, source: str):
-        label = self.mapping_vars[source].get()
-        if label == "None":
-            return None
-        for ch, name in self.channel_names.items():
-            if name == label:
-                return ch
-        return None
+    # --------- Right side: sliders
+    def _build_tuning(self, parent: ttk.Frame, row: int) -> None:
+        box = self._card(parent, "Tuning", row, pady=(0, 0))
+        box.columnconfigure(0, weight=1, uniform="tune")
+        box.columnconfigure(1, weight=1, uniform="tune")
+        motor = lambda v: "off" if v < 0.05 else f"\u00d7{v:.1f}"
+        specs = (
+            ("Strobe rate", "strobe_rate", 0.0, 1.0, lambda v: f"{int(v * 100)} %"),
+            ("Blink length", "blink_ms", 40, 400, lambda v: f"{int(v)} ms"),
+            ("Derby motor", "k_derby", 0.0, 2.0, motor),
+            ("Laser rotation", "k_laser", 0.0, 2.0, motor),
+            ("Pattern speed", "k_show", 0.0, 2.0, motor),
+            ("Sensitivity", None, 0.2, 5.0, lambda v: f"{v:.1f}\u00d7"),
+        )
+        self._look_scales = {}
+        for i, (text, attr, lo, hi, fmt) in enumerate(specs):
+            cell = ttk.Frame(box, style="Plain.Card.TFrame")
+            cell.grid(row=i // 2, column=i % 2, sticky="ew", padx=(0 if i % 2 == 0 else 10, 10 if i % 2 == 0 else 0),
+                      pady=(0, 6))
+            cell.columnconfigure(0, weight=1)
+            head = ttk.Frame(cell, style="Plain.Card.TFrame")
+            head.grid(row=0, column=0, sticky="ew")
+            ttk.Label(head, text=text, style="Card.TLabel").pack(side="left")
+            value = ttk.Label(head, text="", style="Value.TLabel")
+            value.pack(side="right")
+            scale = ttk.Scale(cell, from_=lo, to=hi, orient="horizontal", style="Card.Horizontal.TScale")
+            scale.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+            scale.configure(command=lambda v, a=attr, f=fmt, lab=value: self._on_slider(a, float(v), f, lab))
+            if attr is None:
+                scale.set(self.analyzer.gain)
+            else:
+                self._look_scales[attr] = scale
 
-    # --------- Settings callbacks
-    def _on_gain_change(self, value) -> None:
-        self.analyzer.gain = float(value)
-        if hasattr(self, "gain_value"):
-            self.gain_value.config(text=f"{float(value):.1f}x")
+    # --------- Looks / rules handling
+    def _load_look(self, name: str) -> None:
+        preset = lightengine.BY_NAME.get(name)
+        if preset is None:
+            return
+        self._loading = True
+        try:
+            self.look = preset.copy()
+            self.engine.set_look(self.look)
+            self.look_var.set(preset.name)
+            self.look_desc.config(text=preset.description)
+            look = self.look
+            for (trigger, action), var in self.rule_vars.items():
+                var.set(action in look.rules.get(trigger, ()))
+            self.every_var.set(min(lightengine.BEAT_OPTIONS,
+                                   key=lambda k: abs(lightengine.BEAT_OPTIONS[k] - look.every_beats)))
+            for attr, table in (("led_a", lightengine.LED_COLOURS), ("led_b", lightengine.LED_COLOURS),
+                                ("laser_a", lightengine.LASER_COLOURS), ("laser_b", lightengine.LASER_COLOURS)):
+                key = getattr(look, attr)
+                self._colour_vars[attr].set(table[key][0])
+                self._swatches[attr].config(bg=table[key][1])
+            self.pattern_var.set("Auto (cycle)" if look.pattern == 0 else f"Pattern {look.pattern}")
+            self.base_led_var.set(look.base_led)
+            self.base_laser_var.set(look.base_laser)
+            for attr, scale in self._look_scales.items():
+                scale.set(getattr(look, attr))
+        finally:
+            self._loading = False
 
-    def _on_smoothing_change(self, value) -> None:
-        self.analyzer.smoothing = float(value)
-        if hasattr(self, "smooth_value"):
-            self.smooth_value.config(text=f"{float(value):.2f}")
+    def _mark_custom(self) -> None:
+        if self._loading:
+            return
+        self.look.name = lightengine.CUSTOM
+        self.look_var.set(lightengine.CUSTOM)
+        self.look_desc.config(text="Your own setup. Pick a look above to start over from a ready-made one.")
+
+    def _on_rule_change(self) -> None:
+        if self._loading:
+            return
+        self.look.rules = {trigger: {action for action, _ in lightengine.ACTIONS
+                                     if self.rule_vars[(trigger, action)].get()}
+                           for trigger, _ in lightengine.TRIGGERS}
+        self._mark_custom()
+
+    def _on_every_change(self) -> None:
+        self.look.every_beats = lightengine.BEAT_OPTIONS.get(self.every_var.get(), self.look.every_beats)
+        self._mark_custom()
+
+    def _on_colour_change(self, attr: str, table: dict) -> None:
+        label = self._colour_vars[attr].get()
+        key = next((k for k, (text, _) in table.items() if text == label), getattr(self.look, attr))
+        setattr(self.look, attr, key)
+        self._swatches[attr].config(bg=table[key][1])
+        self._mark_custom()
+
+    def _on_pattern_change(self) -> None:
+        text = self.pattern_var.get()
+        self.look.pattern = 0 if text.startswith("Auto") else int(text.split()[-1])
+        self._mark_custom()
+
+    def _on_base_change(self) -> None:
+        if self._loading:
+            return
+        self.look.base_led = bool(self.base_led_var.get())
+        self.look.base_laser = bool(self.base_laser_var.get())
+        self._mark_custom()
+
+    def _on_slider(self, attr, value: float, fmt, label) -> None:
+        label.config(text=fmt(value))
+        if attr is None:                          # sensitivity belongs to the audio analysis, not to the look
+            self.analyzer.gain = value
+            return
+        if self._loading:
+            return
+        setattr(self.look, attr, int(value) if attr == "blink_ms" else value)
+        self._mark_custom()
+
+    def _on_blackout(self) -> None:
+        self.engine.force_blackout = bool(self.blackout_var.get())
 
     # --------- Audio frames (worker thread -> GUI thread)
     def _on_frame(self, frame: AudioFrame) -> None:
@@ -930,47 +1208,110 @@ class MusicModeWindow(tk.Toplevel):
             self.analyzer.stop()
             return
 
+        self._pulse = frame.beat * 7.0
         self._update_bars(frame.bars)
         self._update_waveform(frame.waveform)
 
-        levels = {"bass": frame.bass, "mid": frame.mid, "treble": frame.treble,
-                  "beat": frame.beat, "pitch": frame.pitch}
+        values = self.engine.process(frame)         # channels 2..9 -- channel 1 is never in here
         current_channels = set()
-        for source, level in levels.items():
-            self.meters[source]["value"] = level * 100
-            channel = self._channel_for(source)
-            if channel is not None:
+        for channel, value in values.items():
+            if channel != 1 and channel in self.channel_names:
                 current_channels.add(channel)
-                self.set_channel_value(channel, int(level * 255))
-
-        # Mapping can change while running -> release sliders that are no
-        # longer mapped to anything
-        freed = self._active_channels - current_channels
-        if freed:
-            self.restore_sliders(list(freed))
+                self.set_channel_value(channel, int(value))
         self._active_channels = current_channels
+        self._update_status(frame)
 
+    def _set_text(self, widget, key: str, text: str) -> None:
+        if self._status_cache.get(key) != text:      # only touch Tk when something actually changed
+            self._status_cache[key] = text
+            widget.config(text=text)
+
+    def _update_status(self, frame: AudioFrame) -> None:
+        engine = self.engine
+        section = engine.section_state
+        if section == SILENCE:
+            self._set_text(self.bpm_label, "bpm", "-- BPM")
+            self._set_text(self.lock_label, "lock", "no music")
+        else:
+            self._set_text(self.bpm_label, "bpm", f"{engine.bpm:.1f} BPM" if engine.tempo_known else "-- BPM")
+            self._set_text(self.lock_label, "lock", "tempo locked" if engine.locked else
+                           ("following kicks" if engine.tempo_known else "listening..."))
+        self._set_text(self.section_label, "section", SECTION_LABELS[section])
+        if self.is_connected is not None:           # is anything going to reach the fixture at all?
+            connected = bool(self.is_connected())
+            self._set_text(self.dmx_label, "dmx", "\u25cf DMX connected" if connected else
+                           "\u25cb DMX NOT connected \u2013 go back to manual control and click Connect")
+            colour = "#4cc38a" if connected else "#e6a23c"
+            if self._status_cache.get("dmx_colour") != colour:
+                self._status_cache["dmx_colour"] = colour
+                self.dmx_label.config(foreground=colour)
+        colour = {DROP: "#e74c3c", BUILD: "#e6a23c", BREAK: self.colors["STATUS_TEXT"],
+                  SILENCE: self.colors["MUTED"]}.get(section, self.colors["FG"])
+        if self._status_cache.get("section_colour") != colour:
+            self._status_cache["section_colour"] = colour
+            self.section_label.config(foreground=colour)
+
+        beat = engine.beat_in_bar if (section != SILENCE and engine.tempo_known) else -1
+        if self._status_cache.get("beat") != beat:
+            self._status_cache["beat"] = beat
+            for i, dot in enumerate(self._beat_dots):
+                self.beat_canvas.itemconfig(dot, fill=(self.colors["ACCENT"] if i == beat else self.colors["BG_LIGHT"]))
+            self._set_text(self.bar_label, "bar", f"bar {engine.bar + 1}" if beat >= 0 else "")
+        self.build_bar["value"] = engine.build_progress * 100
+
+        # little fixture preview: what the lights are doing right now
+        pv = engine.preview
+        state = (frame.beat > 0.5, pv["led"], pv["laser"], pv["strobe"], pv["blackout"])
+        if state != self._preview_state:
+            self._preview_state = state
+            off = "#e74c3c" if pv["blackout"] else self.colors["LINE"]
+            canvas = self.preview_canvas
+            canvas.itemconfig(self._preview_dots["bass"], fill=self.colors["ACCENT2"] if state[0] else "", outline=off if not state[0] else self.colors["ACCENT2"])
+            canvas.itemconfig(self._preview_dots["led"], fill=pv["led"] or "", outline=pv["led"] or off)
+            canvas.itemconfig(self._preview_dots["laser"], fill=pv["laser"] or "", outline=pv["laser"] or off)
+            canvas.itemconfig(self._preview_dots["strobe"], fill="#ffffff" if pv["strobe"] else "",
+                              outline="#ffffff" if pv["strobe"] else off)
+
+    # --------- Visualizer drawing
     def _update_bars(self, bars) -> None:
         if bars is None:
             return
-        bar_w, bar_h = config.BAR_CANVAS_WIDTH, config.BAR_CANVAS_HEIGHT
-        slot = bar_w / config.N_BARS
-        gap = 3
+        self._last_bars = bars
         for i, level in enumerate(bars):
-            x0 = i * slot + gap / 2
-            x1 = x0 + slot - gap
-            self.bar_canvas.coords(self._bar_ids[i], x0, bar_h - level * bar_h, x1, bar_h)
-
             # peak cap: jumps up with the bar, then falls slowly
-            peak = max(level, self._peaks[i] - config.SPECTRUM_PEAK_DECAY)
-            self._peaks[i] = peak
-            py = bar_h - peak * bar_h
-            self.bar_canvas.coords(self._peak_ids[i], x0, py - 2, x1, py)
+            self._peaks[i] = max(float(level), self._peaks[i] - config.SPECTRUM_PEAK_DECAY)
+        self._draw_bars()
+
+    def _draw_bars(self) -> None:
+        geo, canvas, bars = self._geo, self.disc_canvas, self._last_bars
+        if not geo or bars is None:
+            return
+        n = config.N_BARS
+        max_len = geo["max_len"]
+        if geo["ring"]:
+            cx, cy = geo["cx"], geo["cy"]
+            r0 = geo["r_in"] + self._pulse
+            for k in range(self._slots):
+                idx = k if k < n else self._slots - 1 - k
+                dx, dy = self._dirs[k]
+                length = 3 + float(bars[idx]) * max_len
+                canvas.coords(self._bar_ids[k], cx + dx * r0, cy + dy * r0,
+                              cx + dx * (r0 + length), cy + dy * (r0 + length))
+                p = r0 + 5 + self._peaks[idx] * max_len
+                canvas.coords(self._peak_ids[k], cx + dx * p, cy + dy * p, cx + dx * (p + 3), cy + dy * (p + 3))
+        else:
+            base, x0, slot = geo["base_y"], geo["x0"], geo["slot"]
+            for k in range(n):
+                x = x0 + (k + 0.5) * slot
+                canvas.coords(self._bar_ids[k], x, base, x, base - 3 - float(bars[k]) * max_len)
+                py = base - 6 - self._peaks[k] * max_len
+                canvas.coords(self._peak_ids[k], x, py, x, py - 3)
 
     def _update_waveform(self, waveform) -> None:
         if waveform is None or len(waveform) < 2:
             return
-        wave_w, wave_h = config.WAVE_CANVAS_WIDTH, config.WAVE_CANVAS_HEIGHT
+        wave_w = self._wave_w
+        wave_h = self.wave_canvas.winfo_height() or config.WAVE_CANVAS_HEIGHT
         n = len(waveform)
         mid_y = wave_h / 2
         boost = config.WAVE_DISPLAY_GAIN
@@ -980,6 +1321,7 @@ class MusicModeWindow(tk.Toplevel):
             s = max(-1.0, min(1.0, float(sample) * boost))
             points.extend((x, mid_y - s * mid_y * 0.9))
         self.wave_canvas.coords(self._wave_line, *points)
+        self.wave_canvas.coords(self._wave_glow, *points)
 
     # --------- Now Playing
     def _on_playing(self, playing: bool) -> None:
@@ -1039,6 +1381,8 @@ class MusicModeWindow(tk.Toplevel):
         if self.now_playing:
             self.now_playing.stop()
         if self._active_channels:
+            for channel in self._active_channels:    # the sliders keep the last driven value -> don't leave strobes running
+                self.set_channel_value(channel, 0)
             self.restore_sliders(list(self._active_channels))
         self.on_closed()
         self.destroy()
