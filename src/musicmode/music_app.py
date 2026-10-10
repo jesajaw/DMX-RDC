@@ -6,12 +6,16 @@ The Music Mode window. It contains no analysis and no light logic -- it only wir
 
     audio_source.LoopbackSource  ->  analysis.Analyzer  ->  engine.LightEngine  ->  controller.set_many(values, MUSIC)
                                                   \\-> this window (visualisation, status)
-    nowplaying.NowPlayingReader  ->  this window (title / artist / spinning cover)
+    nowplaying.NowPlayingReader  ->  this window (title / artist / spinning cover) + the song key for the analysis cache
 
-Left: the round cover in the middle with the four frequency bands around it (Sub / Bass / Mids / Highs),
-each as an arc of radial bars (bar length = amplitude, mirrored left / right) that flashes on a hit,
-plus the oscilloscope. Right: live status with band meters, the look chips, the rule list
-("when this happens -> do this") and the sensitivity slider.
+Left: the round cover in the middle. Around it the waveform as a closed ring (with two fading echoes) and, further
+out, the four frequency bands (Sub / Bass / Mids / Highs) as radial bars (bar length = amplitude, mirrored left /
+right) whose arcs flash on a hit. No text on it: hover the mouse over the visual and the axes fade in -- dB rings,
+Hz ticks and a read-out of the frequency / level under the cursor.
+
+Right: live status (BPM + re-check button, band meters), the looks as one row of buttons, the mapping grid (band x
+what it does, one click per cell), a few extras as checkboxes and the tuning sliders. The audio device is shown as
+a small icon (speaker / headphones / headset) next to "DMX connected" in the footer.
 
 The main window (DMXUI) is hidden while this is open. Both windows talk to the lights through the same
 DMXController: this window acquire()s it (manual sliders no longer reach the wire, the output starts dark)
@@ -33,12 +37,12 @@ from tkinter import ttk
 import numpy as np
 
 from .. import theme
-from ..config import ACTIVE_SCHEME
+from ..config import ACTIVE_SCHEME, FONT, MONO
 from ..controller import MUSIC, DMXController, apply_dark_titlebar
 from . import config, engine
 from .analysis import BAND_LABELS, BAND_NAMES, BAND_RANGES, Analyzer, Features
 from .audio_source import LoopbackSource
-from .engine import LightEngine, Rule
+from .engine import LightEngine
 from .nowplaying import NowPlayingReader, now_playing_available
 
 try:
@@ -86,144 +90,98 @@ def _combo(parent, options, current, width, command):
     return box
 
 
-class ScrollFrame(ttk.Frame):
-    """A frame with a vertical scrollbar; put the content into .inner."""
-
-    def __init__(self, parent, height: int, bg: str):
-        super().__init__(parent, style="Plain.Card.TFrame")
-        self.canvas = tk.Canvas(self, height=height, bg=bg, highlightthickness=0)
-        bar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=bar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        bar.pack(side="right", fill="y")
-        self.inner = ttk.Frame(self.canvas, style="Plain.Card.TFrame")
-        window = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(window, width=e.width))
-        for widget in (self.canvas, self.inner):
-            widget.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
-            widget.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
-
-    def _wheel(self, event) -> None:
-        self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+def _hz_text(hz: float) -> str:
+    if hz >= 1000:
+        return f"{hz / 1000:.1f}".rstrip("0").rstrip(".") + " kHz"
+    return f"{hz:.0f} Hz"
 
 
-class RuleRow:
-    """One editable rule: SOURCE EVENT  ->  TARGET ACTION VALUE, plus hold and minimum gap."""
+def _device_kind(name: str) -> str:
+    """Rough guess what the capture device is, from its name: speaker | headphones | headset."""
+    n = (name or "").lower()
+    if any(w in n for w in ("headset", "hands-free", "handsfree", "hfp")):
+        return "headset"
+    if any(w in n for w in ("headphone", "kopfh", "airpods", "buds", "earphone", "earbud", "wh-1000", "wf-1000",
+                            "bluetooth", "arctis", "hyperx", "cloud")):
+        return "headphones"
+    return "speaker"
 
-    def __init__(self, parent, rule: Rule, on_change, on_delete):
-        self.rule, self.on_change, self.on_delete = rule, on_change, on_delete
+
+class MappingGrid:
+    """The mapping: one row per source (band / beat), one column per thing it can do. One click per cell.
+
+    flash columns   - / ON / OFF     (LED, Derby, Laser)
+    change columns  - / cycle        (LED pattern, Derby colour, Laser colour, Derby swing, Laser spin)
+    Left click steps forward, right click steps back."""
+
+    def __init__(self, parent, colors: dict, look_getter, on_change):
+        self.colors, self.look_getter, self.on_change = colors, look_getter, on_change
+        self.ink = theme.on_accent(colors)
         self.frame = ttk.Frame(parent, style="Plain.Card.TFrame")
-        self.render()
+        self._cells = {}
+        self._beat_combo = None
+        f = self.frame
+        groups = {}
+        for ci, col in enumerate(engine.COLUMNS):
+            groups.setdefault(col.group, []).append(ci)
+        titles = {"flash": "HIT  =  FLASH", "change": "HIT  =  CHANGE"}
+        for group, cis in groups.items():
+            ttk.Label(f, text=titles[group], style="Group.TLabel").grid(
+                row=0, column=1 + cis[0], columnspan=len(cis), pady=(0, 2))
+        for ci, col in enumerate(engine.COLUMNS):
+            f.columnconfigure(1 + ci, weight=1, uniform="cell")
+            ttk.Label(f, text=col.label, style="CardMuted.TLabel", justify="center").grid(row=1, column=1 + ci)
+        for ri, (source, label) in enumerate(engine.SOURCES):
+            ttk.Label(f, text=label.upper(), style="Card.TLabel").grid(row=2 + ri, column=0, sticky="w", padx=(0, 8))
+            for ci, col in enumerate(engine.COLUMNS):
+                cell = tk.Label(f, width=5, cursor="hand2", font=(FONT, 8, "bold"))
+                cell.grid(row=2 + ri, column=1 + ci, padx=2, pady=2, ipady=3, sticky="ew")
+                cell.bind("<Button-1>", lambda e, s=source, c=col: self._step(s, c, +1))
+                cell.bind("<Button-3>", lambda e, s=source, c=col: self._step(s, c, -1))
+                self._cells[(source, col.key)] = cell
+        self._beat_row = 2 + [src for src, _ in engine.SOURCES].index("beat")
 
-    def _changed(self) -> None:
+    def _state(self, source: str, col) -> str:
+        return self.look_getter().grid.get(engine.cell_key(source, col.key), "")
+
+    def _paint(self, source: str, col) -> None:
+        c, state = self.colors, self._state(source, col)
+        cell = self._cells[(source, col.key)]
+        if state == "on":
+            cell.config(text="ON", bg=c["ACCENT"], fg=self.ink)
+        elif state == "off":
+            cell.config(text="OFF", bg=c["ACCENT_DARK"], fg=c["FG"])
+        elif state == "cycle":
+            cell.config(text="\u21bb", bg=c["ACCENT"], fg=self.ink)
+        else:
+            cell.config(text="\u2013", bg=c["BG"], fg=c["MUTED"])
+
+    def _step(self, source: str, col, direction: int) -> None:
+        look = self.look_getter()
+        states = engine.STATES[col.kind]
+        key = engine.cell_key(source, col.key)
+        new = states[(states.index(self._state(source, col)) + direction) % len(states)]
+        if new:
+            look.grid[key] = new
+        else:
+            look.grid.pop(key, None)
+        self._paint(source, col)
         self.on_change()
 
-    def _line(self, row: int) -> ttk.Frame:
-        line = ttk.Frame(self.frame, style="Plain.Card.TFrame")
-        line.grid(row=row, column=0, sticky="ew", pady=1)
-        return line
-
-    def _pair(self) -> tuple:
-        target = engine.TARGETS[self.rule.target]
-        return tuple(self.rule.values) if len(self.rule.values) >= 2 else tuple(target.options[:2])
-
-    def render(self) -> None:
-        for child in self.frame.winfo_children():
-            child.destroy()
-        rule = self.rule
-        target = engine.TARGETS[rule.target]
-        value_options = [(target.names.get(v, str(v)), v) for v in target.options]
-
-        # line 1: when
-        l1 = self._line(0)
-        _combo(l1, [(label, key) for key, label in engine.SOURCES], rule.source, 7, self._set_source).pack(side="left")
-        if rule.source == "beat":
-            ttk.Label(l1, text="every", style="Card.TLabel").pack(side="left", padx=(8, 4))
-            _combo(l1, list(engine.BEAT_OPTIONS.items()), rule.every_beats, 8, self._set_every).pack(side="left")
-        else:
-            _combo(l1, [(label, key) for key, label in engine.BAND_EVENTS], rule.event, 12,
-                   self._set_event).pack(side="left", padx=(6, 0))
-            if rule.event in ("above", "below"):
-                _combo(l1, [(f"{int(v * 100)} %", v) for v in engine.THRESHOLD_OPTIONS], rule.threshold, 6,
-                       self._set_threshold).pack(side="left", padx=(6, 0))
-        ttk.Label(l1, text="\u2192", style="CardMuted.TLabel").pack(side="left", padx=8)
-        _combo(l1, [(t.label, key) for key, t in engine.TARGETS.items()], rule.target, 19,
-               self._set_target).pack(side="left")
-
-        # line 2: do
-        l2 = self._line(1)
-        _combo(l2, [(label, key) for key, label in engine.ACTIONS], rule.action, 12, self._set_action).pack(side="left")
-        if rule.action == "set":
-            current = rule.values[0] if rule.values else target.options[0]
-            _combo(l2, value_options, current, 20, lambda v: self._set_values((v,))).pack(side="left", padx=(6, 0))
-        elif rule.action == "toggle":
-            a, b = self._pair()
-            ttk.Label(l2, text="A", style="CardMuted.TLabel").pack(side="left", padx=(8, 3))
-            _combo(l2, value_options, a, 16, lambda v: self._set_values((v, self._pair()[1]))).pack(side="left")
-            ttk.Label(l2, text="B", style="CardMuted.TLabel").pack(side="left", padx=(8, 3))
-            _combo(l2, value_options, b, 16, lambda v: self._set_values((self._pair()[0], v))).pack(side="left")
-        else:
-            seq = rule.values or target.cycle
-            text = "through all" if not rule.values else " \u2192 ".join(target.names.get(v, str(v)) for v in seq)
-            ttk.Label(l2, text=text[:46], style="CardMuted.TLabel").pack(side="left", padx=(8, 0))
-        ttk.Button(l2, text="\u2715", width=3, command=lambda: self.on_delete(self)).pack(side="right")
-
-        # line 3: timing
-        l3 = self._line(2)
-        ttk.Label(l3, text="hold", style="CardMuted.TLabel").pack(side="left")
-        _combo(l3, [("off" if ms == 0 else f"{ms} ms", ms) for ms in engine.HOLD_OPTIONS_MS], rule.hold_ms, 7,
-               self._set_hold).pack(side="left", padx=(4, 14))
-        ttk.Label(l3, text="min. gap", style="CardMuted.TLabel").pack(side="left")
-        _combo(l3, [("none" if ms == 0 else f"{ms} ms", ms) for ms in engine.GAP_OPTIONS_MS], rule.cooldown_ms, 7,
-               self._set_gap).pack(side="left", padx=(4, 0))
-
-    # ---- edits (rules are changed in place; the engine picks the change up on the next block)
-    def _set_source(self, key) -> None:
-        self.rule.source = key
-        if key == "beat":
-            self.rule.event = "beat"
-        elif self.rule.event == "beat":
-            self.rule.event = "hit"
-        self.render()
-        self._changed()
-
-    def _set_event(self, key) -> None:
-        self.rule.event = key
-        self.render()
-        self._changed()
-
-    def _set_threshold(self, value) -> None:
-        self.rule.threshold = float(value)
-        self._changed()
+    def refresh(self) -> None:
+        """Repaint every cell for the current look (and rebuild the beat-row selector)."""
+        for source, _ in engine.SOURCES:
+            for col in engine.COLUMNS:
+                self._paint(source, col)
+        if self._beat_combo is not None:
+            self._beat_combo.destroy()
+        look = self.look_getter()
+        self._beat_combo = _combo(self.frame, list(engine.BEAT_OPTIONS.items()), look.beat_every, 7, self._set_every)
+        self._beat_combo.grid(row=self._beat_row, column=1 + len(engine.COLUMNS), padx=(8, 0))
 
     def _set_every(self, beats) -> None:
-        self.rule.every_beats = int(beats)
-        self._changed()
-
-    def _set_target(self, key) -> None:
-        self.rule.target = key
-        self.rule.values = ()
-        self.render()
-        self._changed()
-
-    def _set_action(self, key) -> None:
-        self.rule.action = key
-        self.rule.values = ()
-        self.render()
-        self._changed()
-
-    def _set_values(self, values) -> None:
-        self.rule.values = tuple(values)
-        self._changed()
-
-    def _set_hold(self, ms) -> None:
-        self.rule.hold_ms = int(ms)
-        self._changed()
-
-    def _set_gap(self, ms) -> None:
-        self.rule.cooldown_ms = int(ms)
-        self._changed()
+        self.look_getter().beat_every = int(beats)
+        self.on_change()
 
 
 class MusicModeWindow(tk.Toplevel):
@@ -240,6 +198,7 @@ class MusicModeWindow(tk.Toplevel):
         apply_dark_titlebar(self)
         self.configure(bg=colors["BG"])
         theme.apply_theme(self)
+        ttk.Style(self).configure("Small.TButton", padding=(10, 3))
 
         self.controller = controller
         self.on_closed = on_closed
@@ -263,7 +222,13 @@ class MusicModeWindow(tk.Toplevel):
         self._last_flat = None
         self._peaks = None
         self._pulse = 0.0
-        self._wave_w = config.VIZ_MIN_SIZE
+        self._song_key = ""              # "artist - title" of the playing track (analysis cache key)
+        self._device_name = None         # last device the footer icon was drawn for
+        self._axis_alpha = 0.0           # 0..1, how visible the Hz / dB axes are (fades with the mouse)
+        self._axis_target = 0.0
+        self._mouse = None               # (x, y) on the visual canvas while the mouse is over it
+        self._wave_frame = 0
+        self._wave_layers = None
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -288,7 +253,7 @@ class MusicModeWindow(tk.Toplevel):
     # --------- Layout
     def _build(self) -> None:
         self.columnconfigure(0, weight=3, minsize=480)
-        self.columnconfigure(1, weight=2, minsize=500)
+        self.columnconfigure(1, weight=2, minsize=520)
         self.rowconfigure(0, weight=1)
 
         left = ttk.Frame(self)
@@ -302,16 +267,18 @@ class MusicModeWindow(tk.Toplevel):
         right.columnconfigure(0, weight=1)
         self._build_live(right, 0)
         self._build_looks(right, 1)
-        self._build_rules(right, 2)
-        self._build_tuning(right, 3)
+        self._build_mapping(right, 2)
+        self._build_extras(right, 3)
+        self._build_tuning(right, 4)
         self._load_look(self.look.name)
 
         footer = ttk.Frame(self)
         footer.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 16))
         self.dmx_label = ttk.Label(footer, text="", style="Muted.TLabel")
-        self.dmx_label.pack(side="left", padx=(0, 18))
+        self.dmx_label.pack(side="left", padx=(0, 10))
+        self._build_device_icon(footer)
         self.status_label = ttk.Label(footer, text="", foreground="#c0392b")
-        self.status_label.pack(side="left")
+        self.status_label.pack(side="left", padx=(14, 0))
         ttk.Button(footer, text="Back to Manual Control", command=self._on_close).pack(side="right")
         self.blackout_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(footer, text="\u23fb  Blackout", style="Chip.Toolbutton", variable=self.blackout_var,
@@ -341,6 +308,7 @@ class MusicModeWindow(tk.Toplevel):
                                      highlightthickness=1, highlightbackground=colors["LINE"])
         self.disc_canvas.grid(row=1, column=0, sticky="nsew")
         canvas = self.disc_canvas
+        bg = colors["BG_LIGHT"]
 
         # --- band layout. The ring is mirrored left / right; every half runs from the bottom (Sub) up to the
         # top (Highs). theta = angle from the top, clockwise, for the right half.
@@ -358,6 +326,7 @@ class MusicModeWindow(tk.Toplevel):
             for j in range(count):
                 thetas.append(hi - (j + 0.5) * (span - gap) / count)
                 band_of.append(name)
+        self._thetas = thetas
         self._n_bars = len(thetas)
         self._slots = 2 * self._n_bars                       # first half: right side, second: left side (mirror)
         self._slot_bar = [k % self._n_bars for k in range(self._slots)]
@@ -368,7 +337,31 @@ class MusicModeWindow(tk.Toplevel):
         self._peaks = [0.0] * self._n_bars
         self._bar_cache = [None] * self._slots           # last drawn (bar end, peak end, start radius) per slot
 
-        # items: bars + peak caps, then the hit arcs; created first so the disc is drawn on top
+        # --- items, bottom to top. 1) the axes (invisible until the mouse is over the visual)
+        self._db_rings = [canvas.create_oval(0, 0, 0, 0, outline=bg, dash=(2, 5)) for _ in config.AXIS_DB_STEPS]
+        self._ticks, self._tick_lines, self._tick_labels = [], [], []
+        for hz in config.AXIS_HZ_TICKS:
+            theta = self._freq_theta(hz)
+            if theta is None:
+                continue
+            self._ticks.append((hz, theta))
+            self._tick_lines.append((canvas.create_line(0, 0, 0, 0, fill=bg), canvas.create_line(0, 0, 0, 0, fill=bg)))
+            suffix = " Hz" if hz in (config.AXIS_HZ_TICKS[0], config.AXIS_HZ_TICKS[-1]) else ""
+            self._tick_labels.append(canvas.create_text(0, 0, text=_freq_text(hz) + suffix, fill=bg,
+                                                        font=(FONT, 8)))
+
+        # 2) the waveform ring: the live wave plus fading echoes (outermost echo first, so the live one is on top)
+        self._wave_items = []
+        for i in reversed(range(config.WAVE_RING_LAYERS)):
+            colour = theme.lerp_colour(colors["ACCENT2"], bg, min(0.85, 0.45 * i))
+            self._wave_items.append(canvas.create_line(0, 0, 0, 0, fill=colour, width=2 if i == 0 else 1,
+                                                       joinstyle="round"))
+        self._wave_items.reverse()                        # index 0 = the live wave
+        self._wave_n = 120                                # points per half circle (the ring is mirrored)
+        phis = np.linspace(0.0, 2 * math.pi, 2 * self._wave_n, endpoint=False)
+        self._wave_sin, self._wave_cos = np.sin(phis), np.cos(phis)
+
+        # 3) bars + peak caps, then the hit arcs; the disc is drawn on top later
         self._bar_ids, self._peak_ids = [], []
         for k in range(self._slots):
             colour = self._band_colour[band_of[self._slot_bar[k]]]
@@ -381,12 +374,12 @@ class MusicModeWindow(tk.Toplevel):
             right = canvas.create_arc(0, 0, 1, 1, start=90 - hi, extent=hi - lo, style="arc", outline=dim, width=3)
             left = canvas.create_arc(0, 0, 1, 1, start=90 + lo, extent=hi - lo, style="arc", outline=dim, width=3)
             self._arc_ids[name] = (right, left)
-        self._band_labels = {}
-        for name in BAND_NAMES:
-            lo_hz, hi_hz = BAND_RANGES[name]
-            self._band_labels[name] = canvas.create_text(
-                0, 0, text=f"{BAND_LABELS[name].upper()}\n{_freq_text(lo_hz)}\u2013{_freq_text(hi_hz)} Hz",
-                fill=colors["MUTED"], font=(theme.FONT, 8, "bold"), justify="center")
+
+        # 4) dB labels above the bars (on a small background so they stay readable)
+        self._db_bg = [canvas.create_rectangle(0, 0, 0, 0, fill=bg, outline="", state="hidden")
+                       for _ in config.AXIS_DB_STEPS]
+        self._db_text = [canvas.create_text(0, 0, text=f"{db} dB" if db == 0 else str(db), fill=bg, font=(MONO, 8))
+                         for db in config.AXIS_DB_STEPS]
 
         # the disc: rings, rotating pixel dots (fallback while there is no cover), centre dot, cover on top
         r_disc = config.DISC_SIZE / 2
@@ -411,16 +404,18 @@ class MusicModeWindow(tk.Toplevel):
         self._disc_angle = 0.0
         self._playing = True       # disc only spins while music is playing
 
+        # 5) the cursor read-out (Hz / dB under the mouse), topmost
+        self._cur_ray = canvas.create_line(0, 0, 0, 0, fill=colors["FG"], dash=(3, 3), state="hidden")
+        self._cur_dot = canvas.create_oval(0, 0, 0, 0, outline=colors["FG"], width=2, state="hidden")
+        self._cur_bg = canvas.create_rectangle(0, 0, 0, 0, fill=colors["BG"], outline=colors["LINE"], state="hidden")
+        self._cur_text = canvas.create_text(0, 0, text="", fill=colors["FG"], font=(MONO, 9), state="hidden")
+        self._cursor_key = None
+
         self._geo = {}
         canvas.bind("<Configure>", lambda e: self._layout_viz())
-
-        self.wave_canvas = tk.Canvas(parent, height=config.WAVE_CANVAS_HEIGHT, bg=colors["BG_LIGHT"],
-                                     highlightthickness=1, highlightbackground=colors["LINE"])
-        self.wave_canvas.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        self._wave_glow = self.wave_canvas.create_line(0, 0, 0, 0, fill=colors["ACCENT_DARK"], width=5)
-        self._wave_line = self.wave_canvas.create_line(0, 0, 0, 0, fill=colors["ACCENT2"], width=1.5)
-        self._wave_mid = self.wave_canvas.create_line(0, 0, 0, 0, fill=colors["LINE"])
-        self.wave_canvas.bind("<Configure>", self._on_wave_resize)
+        canvas.bind("<Enter>", lambda e: self._set_axis_target(1.0))
+        canvas.bind("<Leave>", lambda e: self._on_mouse_leave())
+        canvas.bind("<Motion>", self._on_mouse_move)
 
         if now_playing_available():            # otherwise: just no title / cover
             self.now_playing = NowPlayingReader(on_update=self._on_now_playing, on_playing=self._on_playing)
@@ -429,13 +424,10 @@ class MusicModeWindow(tk.Toplevel):
         self._layout_viz()
         self._spin_disc()
 
-    def _on_wave_resize(self, event) -> None:
-        self._wave_w = max(10, event.width)
-        mid = event.height / 2
-        self.wave_canvas.coords(self._wave_mid, 0, mid, self._wave_w, mid)
+
 
     def _layout_viz(self) -> None:
-        """(Re)computes the geometry of the disc and the band ring for the current canvas size."""
+        """(Re)computes the geometry of the disc, the waveform ring, the band ring and the axes for the canvas size."""
         canvas = self.disc_canvas
         w, h = canvas.winfo_width(), canvas.winfo_height()
         if w < 60 or h < 60:
@@ -445,7 +437,7 @@ class MusicModeWindow(tk.Toplevel):
         r_in = r_disc + config.RING_GAP
         max_len = max(18.0, min(w, h) / 2 - r_in - config.BAND_LABEL_MARGIN)
         width = max(2.0, 2 * math.pi * (r_in + 8) / self._slots * 0.55)
-        self._geo = dict(cx=cx, cy=cy, r_in=r_in, max_len=max_len)
+        self._geo = dict(cx=cx, cy=cy, r_in=r_in, max_len=max_len, r_wave=r_disc + config.WAVE_RING_OFFSET)
 
         for item, radius in zip(self._ring_ovals, self._disc_radii):
             canvas.coords(item, cx - radius, cy - radius, cx + radius, cy + radius)
@@ -456,17 +448,127 @@ class MusicModeWindow(tk.Toplevel):
             canvas.itemconfig(self._peak_ids[k], width=width)
 
         r_arc = r_in - 6
-        r_label = r_in + max_len + 22
         for name in BAND_NAMES:
             for item in self._arc_ids[name]:
                 canvas.coords(item, cx - r_arc, cy - r_arc, cx + r_arc, cy + r_arc)
-            lo, hi = self._arc_span[name]
-            mid = math.radians((lo + hi) / 2)
-            canvas.coords(self._band_labels[name], cx + math.sin(mid) * r_label, cy - math.cos(mid) * r_label)
+
+        # axes: dB rings (a bar of level L ends at r_in + 3 + L * max_len), Hz ticks outside the longest bar
+        for ring, bg_item, text, db in zip(self._db_rings, self._db_bg, self._db_text, config.AXIS_DB_STEPS):
+            r = r_in + 3 + (1.0 + db / config.DB_RANGE_BARS) * max_len
+            canvas.coords(ring, cx - r, cy - r, cx + r, cy + r)
+            canvas.coords(text, cx, cy - r)
+            x0, y0, x1, y1 = canvas.bbox(text)
+            canvas.coords(bg_item, x0 - 3, y0 - 1, x1 + 3, y1 + 1)
+        r_out = r_in + max_len + 6
+        for (hz, theta), (right, left), label in zip(self._ticks, self._tick_lines, self._tick_labels):
+            a = math.radians(theta)
+            sx, sy = math.sin(a), -math.cos(a)
+            canvas.coords(right, cx + sx * r_out, cy + sy * r_out, cx + sx * (r_out + 8), cy + sy * (r_out + 8))
+            canvas.coords(left, cx - sx * r_out, cy + sy * r_out, cx - sx * (r_out + 8), cy + sy * (r_out + 8))
+            canvas.coords(label, cx + sx * (r_out + 24), cy + sy * (r_out + 24))
+        self._apply_axis_alpha()
+
         self._place_dots()
         self._bar_cache = [None] * self._slots           # geometry changed -> every bar has to be redrawn
         if self._last_flat is not None:
             self._draw_bars()
+        self._cursor_key = None
+
+    # ---- Hz <-> angle (the bars are log-spaced inside each band, band after band, bottom = Sub, top = Highs)
+    def _freq_theta(self, hz: float):
+        for name in BAND_NAMES:
+            lo_hz, hi_hz = BAND_RANGES[name]
+            if lo_hz <= hz <= hi_hz:
+                lo, hi = self._arc_span[name]
+                return hi - math.log(hz / lo_hz) / math.log(hi_hz / lo_hz) * (hi - lo)
+        return None
+
+    def _theta_freq(self, theta: float) -> float:
+        for name in BAND_NAMES:
+            lo, hi = self._arc_span[name]
+            if lo - 2.0 <= theta <= hi + 2.0:
+                lo_hz, hi_hz = BAND_RANGES[name]
+                frac = min(1.0, max(0.0, (hi - theta) / (hi - lo)))
+                return lo_hz * (hi_hz / lo_hz) ** frac
+        return float(BAND_RANGES[BAND_NAMES[0]][0])
+
+    # ---- the dynamic axes
+    def _set_axis_target(self, value: float) -> None:
+        self._axis_target = value
+
+    def _on_mouse_leave(self) -> None:
+        self._axis_target = 0.0
+        self._mouse = None
+
+    def _on_mouse_move(self, event) -> None:
+        self._axis_target = 1.0
+        self._mouse = (event.x, event.y)
+
+    def _apply_axis_alpha(self) -> None:
+        canvas, c, a = self.disc_canvas, self.colors, self._axis_alpha
+        line = theme.lerp_colour(c["BG_LIGHT"], c["MUTED"], a * 0.8)
+        text = theme.lerp_colour(c["BG_LIGHT"], c["MUTED"], a)
+        for ring in self._db_rings:
+            canvas.itemconfig(ring, outline=line)
+        for right, left in self._tick_lines:
+            canvas.itemconfig(right, fill=line)
+            canvas.itemconfig(left, fill=line)
+        for label in self._tick_labels:
+            canvas.itemconfig(label, fill=text)
+        for bg_item, label in zip(self._db_bg, self._db_text):
+            canvas.itemconfig(label, fill=theme.lerp_colour(c["BG_LIGHT"], c["FG"], a * 0.9))
+            canvas.itemconfig(bg_item, state="normal" if a > 0.05 else "hidden")
+
+    def _update_axes(self) -> None:
+        a, target = self._axis_alpha, self._axis_target
+        if a != target:
+            step = config.AXIS_FADE_STEP
+            self._axis_alpha = a = a + max(-step, min(step, target - a))
+            self._apply_axis_alpha()
+        self._update_cursor()
+
+    def _update_cursor(self) -> None:
+        canvas, geo = self.disc_canvas, self._geo
+        items = (self._cur_ray, self._cur_dot, self._cur_bg, self._cur_text)
+        mouse = self._mouse
+        if not geo or mouse is None or self._axis_alpha < 0.3:
+            if self._cursor_key is not None:
+                self._cursor_key = None
+                for item in items:
+                    canvas.itemconfig(item, state="hidden")
+            return
+        if self._cursor_key == mouse:
+            return
+        cx, cy, r_in, max_len = geo["cx"], geo["cy"], geo["r_in"], geo["max_len"]
+        dx, dy = mouse[0] - cx, mouse[1] - cy
+        r = math.hypot(dx, dy)
+        if not (r_in - 4 <= r <= r_in + max_len + 30):
+            if self._cursor_key is not None:
+                for item in items:
+                    canvas.itemconfig(item, state="hidden")
+            self._cursor_key = None
+            return
+        self._cursor_key = mouse
+        theta = math.degrees(math.atan2(dx, -dy)) % 360.0
+        if theta > 180.0:
+            theta = 360.0 - theta                        # the ring is mirrored
+        level = min(1.0, max(0.0, (r - r_in - 3) / max_len))
+        db = -(1.0 - level) * config.DB_RANGE_BARS
+        ux, uy = dx / r, dy / r
+        canvas.coords(self._cur_ray, cx + ux * r_in, cy + uy * r_in, cx + ux * (r_in + max_len + 4),
+                      cy + uy * (r_in + max_len + 4))
+        canvas.coords(self._cur_dot, mouse[0] - 4, mouse[1] - 4, mouse[0] + 4, mouse[1] + 4)
+        anchor, tx = ("e", mouse[0] - 12) if dx > 0 else ("w", mouse[0] + 12)
+        canvas.itemconfig(self._cur_text, text=f"{_hz_text(self._theta_freq(theta))}   {db:.0f} dB", anchor=anchor)
+        canvas.coords(self._cur_text, tx, mouse[1] - 14)
+        x0, y0, x1, y1 = canvas.bbox(self._cur_text)
+        canvas.coords(self._cur_bg, x0 - 4, y0 - 2, x1 + 4, y1 + 2)
+        for item in items:
+            canvas.itemconfig(item, state="normal")
+        canvas.tag_raise(self._cur_ray)
+        canvas.tag_raise(self._cur_dot)
+        canvas.tag_raise(self._cur_bg)
+        canvas.tag_raise(self._cur_text)
 
     def _place_dots(self) -> None:
         cx, cy = self._geo.get("cx", config.VIZ_MIN_SIZE / 2), self._geo.get("cy", config.VIZ_MIN_SIZE / 2)
@@ -502,8 +604,9 @@ class MusicModeWindow(tk.Toplevel):
         self.bpm_label.grid(row=0, column=0, sticky="w")
         self.lock_label = ttk.Label(box, text="listening...", style="Hint.TLabel")
         self.lock_label.grid(row=1, column=0, sticky="w")
-        self.section_label = ttk.Label(box, text="", style="Section.TLabel")
-        self.section_label.grid(row=0, column=1, rowspan=2, sticky="e")
+        self.recheck_btn = ttk.Button(box, text="\u21bb  Re-check BPM", style="Small.TButton",
+                                      command=self._recheck_tempo)
+        self.recheck_btn.grid(row=0, column=1, rowspan=2, sticky="e")
 
         self.beat_canvas = tk.Canvas(box, width=150, height=22, bg=colors["BG_LIGHT"], highlightthickness=0)
         self.beat_canvas.grid(row=2, column=0, sticky="w", pady=(10, 0))
@@ -522,7 +625,7 @@ class MusicModeWindow(tk.Toplevel):
         for i, name in enumerate(BAND_NAMES):
             y = 4 + i * row_h
             self.meter_canvas.create_text(4, y + 8, text=BAND_LABELS[name].upper(), anchor="w",
-                                          fill=colors["MUTED"], font=(theme.FONT, 8, "bold"))
+                                          fill=colors["MUTED"], font=(FONT, 8, "bold"))
             self.meter_canvas.create_rectangle(bar_x0, y + 2, bar_x1, y + 14, outline=colors["LINE"])
             self._meter_fill[name] = self.meter_canvas.create_rectangle(bar_x0, y + 2, bar_x0, y + 14,
                                                                         fill=self._band_colour[name], outline="")
@@ -537,10 +640,10 @@ class MusicModeWindow(tk.Toplevel):
             x = 6 + i * 140
             self._preview_dots[key] = self.preview_canvas.create_oval(x, 5, x + 16, 21, outline=colors["LINE"], width=2)
             self.preview_canvas.create_text(x + 24, 13, text=text, anchor="w", fill=colors["MUTED"],
-                                            font=(theme.FONT, 8, "bold"))
+                                            font=(FONT, 8, "bold"))
             self._preview_texts[key] = self.preview_canvas.create_text(x + 24 + 8 * len(text) + 6, 13, text="",
                                                                        anchor="w", fill=colors["FG"],
-                                                                       font=(theme.FONT, 8))
+                                                                       font=(FONT, 8))
 
     # --------- Right side: quick looks
     def _build_looks(self, parent: ttk.Frame, row: int) -> None:
@@ -549,69 +652,68 @@ class MusicModeWindow(tk.Toplevel):
         buttons = ttk.Frame(box, style="Plain.Card.TFrame")
         buttons.grid(row=0, column=0, sticky="ew")
         for i, look in enumerate(engine.QUICK_LOOKS):
-            buttons.columnconfigure(i % 3, weight=1, uniform="looks")
+            buttons.columnconfigure(i, weight=1, uniform="looks")
             ttk.Radiobutton(buttons, text=look.name, value=look.name, variable=self.look_var,
                             style="Look.Toolbutton", command=lambda n=look.name: self._load_look(n)
-                            ).grid(row=i // 3, column=i % 3, sticky="ew", padx=2, pady=2)
-        self.look_desc = ttk.Label(box, text="", style="Hint.TLabel", wraplength=470, justify="left")
+                            ).grid(row=0, column=i, sticky="ew", padx=2, pady=2)
+        self.look_desc = ttk.Label(box, text="", style="Hint.TLabel", wraplength=490, justify="left")
         self.look_desc.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-    # --------- Right side: the rules
-    def _build_rules(self, parent: ttk.Frame, row: int) -> None:
-        box = self._card(parent, "When this happens  \u2192  do this", row)
+    # --------- Right side: the mapping grid
+    def _build_mapping(self, parent: ttk.Frame, row: int) -> None:
+        box = self._card(parent, "When this hits  \u2192  do this", row)
         box.columnconfigure(0, weight=1)
-        self.rule_scroll = ScrollFrame(box, height=250, bg=self.colors["BG_LIGHT"])
-        self.rule_scroll.grid(row=0, column=0, sticky="ew")
-        self.rule_scroll.inner.columnconfigure(0, weight=1)
-        ttk.Button(box, text="+  Add rule", command=self._add_rule).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.grid_widget = MappingGrid(box, self.colors, lambda: self.look, self._on_grid_edit)
+        self.grid_widget.frame.grid(row=0, column=0, sticky="ew")
+        ttk.Label(box, text="Click a cell:  \u2013  \u2192  ON (flash on hit)  \u2192  OFF (dark on hit).  "
+                            "\u21bb steps to the next pattern / colour on every hit.  Right-click goes back.",
+                  style="Hint.TLabel", wraplength=490, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-    def _rebuild_rules(self) -> None:
-        for row in self.rows:
-            row.frame.destroy()
-        for child in self.rule_scroll.inner.winfo_children():
-            child.destroy()
-        self.rows = []
-        for i, rule in enumerate(self.look.rules):
-            if i:
-                ttk.Separator(self.rule_scroll.inner, orient="horizontal").grid(
-                    row=2 * i - 1, column=0, sticky="ew", pady=6)
-            row = RuleRow(self.rule_scroll.inner, rule, self._on_rule_edit, self._delete_rule)
-            row.frame.grid(row=2 * i, column=0, sticky="ew")
-            self.rows.append(row)
-
-    def _add_rule(self) -> None:
-        self.look.rules.append(Rule(source="bass", event="hit", target="led.on", action="set",
-                                    values=(True,), hold_ms=120))
-        self._rebuild_rules()
-        self._mark_custom()
-        self.after(50, lambda: self.rule_scroll.canvas.yview_moveto(1.0))
-
-    def _delete_rule(self, row: RuleRow) -> None:
-        if row.rule in self.look.rules:
-            self.look.rules.remove(row.rule)
-        self._rebuild_rules()
+    def _on_grid_edit(self) -> None:
+        if self._loading:
+            return
+        self.engine.rebuild()
         self._mark_custom()
 
-    def _on_rule_edit(self) -> None:
-        self._mark_custom()
+    # --------- Right side: extras (checkboxes)
+    def _build_extras(self, parent: ttk.Frame, row: int) -> None:
+        box = self._card(parent, "Extras", row)
+        box.columnconfigure(0, weight=1)
+        self.bouncy_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Bouncy Bass", style="Card.TCheckbutton", variable=self.bouncy_var,
+                        command=lambda: setattr(self.engine, "bouncy", bool(self.bouncy_var.get()))
+                        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(box, text=f"Derby motor jumps between position {config.BOUNCE_POS_MIN} and {config.BOUNCE_POS_MAX} "
+                            f"on every kick; every 2nd (3rd ...) kick when they come faster than the motor can "
+                            f"follow (BOUNCE_TRAVEL_S = {config.BOUNCE_TRAVEL_S} s).",
+                  style="Hint.TLabel", wraplength=470, justify="left").grid(row=1, column=0, sticky="w", padx=(22, 0))
+        self.learn_var = tk.BooleanVar(value=self.analyzer.learning)
+        ttk.Checkbutton(box, text="Learn kick & thresholds per song", style="Card.TCheckbutton",
+                        variable=self.learn_var,
+                        command=lambda: setattr(self.analyzer, "learning", bool(self.learn_var.get()))
+                        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
     # --------- Right side: sliders
     def _build_tuning(self, parent: ttk.Frame, row: int) -> None:
         box = self._card(parent, "Tuning", row, pady=(0, 0))
         box.columnconfigure(0, weight=1)
-        head = ttk.Frame(box, style="Plain.Card.TFrame")
-        head.grid(row=0, column=0, sticky="ew")
-        ttk.Label(head, text="Sensitivity", style="Card.TLabel").pack(side="left")
-        value = ttk.Label(head, text=f"{self.analyzer.gain:.1f}\u00d7", style="Value.TLabel")
-        value.pack(side="right")
-        scale = ttk.Scale(box, from_=0.2, to=5.0, orient="horizontal", style="Card.Horizontal.TScale")
-        scale.grid(row=1, column=0, sticky="ew", pady=(3, 0))
-        scale.set(self.analyzer.gain)
-        scale.configure(command=lambda v, lab=value: self._on_sensitivity(float(v), lab))
+        self._slider(box, 0, "Sensitivity", 0.2, 5.0, self.analyzer.gain, lambda v: f"{v:.1f}\u00d7",
+                     lambda v: setattr(self.analyzer, "gain", v))
+        self._slider(box, 2, "Smoothness", 0.0, 0.95, self.analyzer.smoothing, lambda v: f"{round(v / 0.95 * 100)} %",
+                     lambda v: setattr(self.analyzer, "smoothing", v), pady=(8, 0))
 
-    def _on_sensitivity(self, value: float, label) -> None:
-        label.config(text=f"{value:.1f}\u00d7")
-        self.analyzer.gain = value
+    def _slider(self, box, row: int, title: str, low: float, high: float, value: float, fmt, apply, pady=(0, 0)) -> None:
+        head = ttk.Frame(box, style="Plain.Card.TFrame")
+        head.grid(row=row, column=0, sticky="ew", pady=pady)
+        ttk.Label(head, text=title, style="Card.TLabel").pack(side="left")
+        label = ttk.Label(head, text=fmt(value), style="Value.TLabel")
+        label.pack(side="right")
+        scale = ttk.Scale(box, from_=low, to=high, orient="horizontal", style="Card.Horizontal.TScale")
+        scale.grid(row=row + 1, column=0, sticky="ew", pady=(3, 0))
+        scale.set(value)
+        scale.configure(command=lambda v: (label.config(text=fmt(float(v))), apply(float(v))))
+
+
 
     # --------- Looks handling
     def _load_look(self, name: str) -> None:
@@ -624,7 +726,7 @@ class MusicModeWindow(tk.Toplevel):
             self.engine.set_look(self.look)
             self.look_var.set(preset.name)
             self.look_desc.config(text=preset.description)
-            self._rebuild_rules()
+            self.grid_widget.refresh()
         finally:
             self._loading = False
 
@@ -637,6 +739,55 @@ class MusicModeWindow(tk.Toplevel):
 
     def _on_blackout(self) -> None:
         self.engine.force_blackout = bool(self.blackout_var.get())
+
+    # --------- Footer: the audio device as a small symbol
+    def _build_device_icon(self, parent: ttk.Frame) -> None:
+        self.device_canvas = tk.Canvas(parent, width=30, height=24, bg=self.colors["BG"], highlightthickness=0)
+        self.device_canvas.pack(side="left")
+        self._tip = None
+        self.device_canvas.bind("<Enter>", self._show_device_tip)
+        self.device_canvas.bind("<Leave>", self._hide_device_tip)
+        self._draw_device_icon("")
+
+    def _draw_device_icon(self, name: str) -> None:
+        """Speaker box, headphones or headset -- guessed from the capture device's name; dim while there is none."""
+        canvas, colors = self.device_canvas, self.colors
+        canvas.delete("all")
+        col = colors["ACCENT2"] if name else colors["LINE"]
+        kind = _device_kind(name)
+        if kind == "speaker":
+            canvas.create_rectangle(7, 2, 23, 22, outline=col, width=2)
+            canvas.create_oval(11, 9, 19, 17, outline=col, width=2)
+            canvas.create_oval(13, 4, 17, 8, outline=col, width=1)
+        else:
+            canvas.create_arc(5, 2, 25, 22, start=0, extent=180, style="arc", outline=col, width=2)
+            canvas.create_rectangle(4, 11, 9, 19, outline=col, fill=col)
+            canvas.create_rectangle(21, 11, 26, 19, outline=col, fill=col)
+            if kind == "headset":
+                canvas.create_line(6, 19, 8, 22, 15, 22, fill=col, width=2, smooth=True)
+                canvas.create_oval(14, 20, 18, 24, outline=col, fill=col)
+        self._tip_text = name or "no audio device yet (waiting for sound)"
+
+    def _show_device_tip(self, event) -> None:
+        self._hide_device_tip()
+        tip = self._tip = tk.Toplevel(self)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{event.x_root + 12}+{event.y_root - 30}")
+        tk.Label(tip, text=self._tip_text, bg=self.colors["BG_LIGHT"], fg=self.colors["FG"], font=(FONT, 9),
+                 relief="solid", borderwidth=1, padx=6, pady=2).pack()
+
+    def _hide_device_tip(self, event=None) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+    # --------- Tempo re-check
+    def _recheck_tempo(self) -> None:
+        """Forget tempo and bar count and listen again (the bar counter restarts with the new lock)."""
+        self.analyzer.request_tempo_recheck()
+        self._set_text(self.lock_label, "lock", "re-checking tempo...")
+        self._set_text(self.bar_label, "bar", "")
+        self._status_cache["beat"] = None
 
     # --------- Audio blocks
     # The lights are computed and written to the DMX buffer right here on the capture thread: no Tk event queue,
@@ -692,6 +843,7 @@ class MusicModeWindow(tk.Toplevel):
         self._update_bars(features.bars, config.SPECTRUM_PEAK_DECAY * step)
         self._update_arcs()
         self._update_waveform(features.waveform)
+        self._update_axes()
         self._update_status(features)
 
     def _set_text(self, widget, key: str, text: str) -> None:
@@ -706,11 +858,13 @@ class MusicModeWindow(tk.Toplevel):
             self._set_text(self.lock_label, "lock", "no music")
         else:
             self._set_text(self.bpm_label, "bpm", f"{f.bpm:.1f} BPM" if f.tempo_known else "-- BPM")
-            self._set_text(self.lock_label, "lock", "tempo locked" if f.locked else
-                           ("following kicks" if f.tempo_known else "listening..."))
-        device = self.source.device_name
-        self._set_text(self.section_label, "device", (device[:30] + "\u2026" if len(device) > 31 else device)
-                       if device else ("no signal" if not f.active else ""))
+            state = "tempo locked" if f.locked else ("following kicks" if f.tempo_known else "listening...")
+            if f.kick_hz:
+                state += f"  \u00b7  kick \u2248 {f.kick_hz:.0f} Hz" + ("" if f.kick_learned else " (learning)")
+            self._set_text(self.lock_label, "lock", state)
+        if self.source.device_name != self._device_name:
+            self._device_name = self.source.device_name
+            self._draw_device_icon(self._device_name)
         connected = self.controller.connected         # is anything going to reach the fixture at all?
         self._set_text(self.dmx_label, "dmx", "\u25cf DMX connected" if connected else
                        "\u25cb DMX NOT connected \u2013 go back to manual control and click Connect")
@@ -805,19 +959,31 @@ class MusicModeWindow(tk.Toplevel):
                 self.disc_canvas.itemconfig(item, outline=colour)
 
     def _update_waveform(self, waveform) -> None:
-        if waveform is None or len(waveform) < 2:
+        """The waveform as a closed ring around the disc, mirrored left / right so the ends meet; older frames trail
+        behind as dimmer echoes a little further out."""
+        if waveform is None or len(waveform) < 2 or not self._geo:
             return
-        wave_w = self._wave_w
-        mid_y = (self.wave_canvas.winfo_height() or config.WAVE_CANVAS_HEIGHT) / 2
-        scale = mid_y * 0.9
-        n = len(waveform)
-        xs = np.linspace(0.0, wave_w, n)
-        ys = mid_y - np.clip(np.asarray(waveform, dtype=np.float64) * config.WAVE_DISPLAY_GAIN, -1.0, 1.0) * scale
-        points = np.empty(2 * n)
-        points[0::2], points[1::2] = xs, ys
-        points = points.tolist()
-        self.wave_canvas.coords(self._wave_line, *points)
-        self.wave_canvas.coords(self._wave_glow, *points)
+        n = self._wave_n
+        wave = np.asarray(waveform, dtype=np.float64)
+        wave = np.interp(np.linspace(0.0, len(wave) - 1, n), np.arange(len(wave)), wave)
+        wave = np.clip(np.convolve(wave, (0.25, 0.5, 0.25), mode="same") * config.WAVE_DISPLAY_GAIN, -1.0, 1.0)
+        layers = self._wave_layers
+        if layers is None:
+            layers = self._wave_layers = [wave] * config.WAVE_RING_LAYERS
+        self._wave_frame += 1
+        if self._wave_frame % config.WAVE_ECHO_EVERY == 0:
+            layers = self._wave_layers = [layers[0]] + layers[:-1]       # the live wave moves on to the first echo
+        layers[0] = wave
+        geo, canvas = self._geo, self.disc_canvas
+        cx, cy = geo["cx"], geo["cy"]
+        for i, (item, layer) in enumerate(zip(self._wave_items, layers)):
+            ring = np.concatenate((layer, layer[::-1]))
+            r = geo["r_wave"] + i * config.WAVE_ECHO_STEP + ring * config.WAVE_RING_AMP * (1.0 - 0.25 * i)
+            xs, ys = cx + self._wave_sin * r, cy - self._wave_cos * r
+            pts = np.empty(2 * len(xs) + 2)
+            pts[0:-2:2], pts[1:-2:2] = xs, ys
+            pts[-2], pts[-1] = xs[0], ys[0]                              # close the ring
+            canvas.coords(item, *pts.tolist())
 
     # --------- Now Playing
     def _on_playing(self, playing: bool) -> None:
@@ -832,6 +998,10 @@ class MusicModeWindow(tk.Toplevel):
     def _apply_now_playing(self, title: str, artist: str, cover_bytes) -> None:
         self.track_label.config(text=title or "")
         self.artist_label.config(text=artist or "")
+        key = " - ".join(part.strip() for part in (artist, title) if part and part.strip())
+        if key != self._song_key:                        # a different track: the analysis switches to its cached values
+            self._song_key = key
+            self.analyzer.request_song(key or None)
 
         if not _PIL_AVAILABLE:
             logging.warning("Pillow is not installed -- no cover art (pip install pillow)")
@@ -873,7 +1043,9 @@ class MusicModeWindow(tk.Toplevel):
 
     # --------- Closing
     def _on_close(self) -> None:
+        self._hide_device_tip()
         self.source.stop()
+        self.analyzer.flush()                        # learned kick frequencies etc. go to song_profiles.json
         if self.now_playing:
             self.now_playing.stop()
         self.controller.release(MUSIC)               # the manual setup goes back on the wire

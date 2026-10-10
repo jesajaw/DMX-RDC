@@ -44,3 +44,7 @@ COLOR_STATUS_TEXT = ACTIVE_SCHEME["STATUS_TEXT"]
 
 # main.py lives at the project root, config.py in <root>/src -- hence two levels up
 PRESETS_DIR = Path(__file__).resolve().parent.parent / "presets"
+
+
+FONT = "Segoe UI"
+MONO = "Consolas"

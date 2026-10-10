@@ -62,11 +62,11 @@ class DMXController:
     """
 
     def __init__(self, on_lost=None):
-        self.on_lost = on_lost                      # callback(error), called from the send thread
+        self.on_lost = on_lost # callback(error), called from the send thread
         self._live = bytearray(config.UNIVERSE_SIZE)
         self._manual = bytearray(config.UNIVERSE_SIZE)
-        self._owner: str | None = None              # None = manual, else the source that acquired the lights
-        self._ser = None
+        self._owner: str | None = None # None = manual, else the source that acquired the lights
+        self._serial = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -116,21 +116,22 @@ class DMXController:
     # ---- connection
     @property
     def connected(self) -> bool:
-        return self._ser is not None
+        return self._serial is not None
 
     def connect(self, port: str) -> None:
         """Opens the port (can block -> call from a worker thread) and starts sending. Raises on failure."""
         if self.connected:
             return
-        self._ser = serial.Serial(port=port, baudrate=250000, bytesize=serial.EIGHTBITS,
-                                  parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_TWO)
+        self._serial = serial.Serial(port=port, baudrate=250000, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_TWO)
         self._stop.clear()
-        self._thread = threading.Thread(target=self._send_loop, args=(self._ser,), daemon=True)
+        self._thread = threading.Thread(target=self._send_loop, args=(self._serial,), daemon=True)
         self._thread.start()
+        # self.run_test()
+        # todo => go through mult. programms / channels to see connected
 
     def disconnect(self) -> None:
         """Stops sending, sends one all-zero frame, closes the port."""
-        ser, self._ser = self._ser, None
+        ser, self._serial = self._serial, None
         if ser is None:
             return
         self._stop.set()
@@ -158,7 +159,7 @@ class DMXController:
             try:
                 self._write_frame(ser)
             except (serial.SerialException, OSError) as error:
-                self._ser = None                    # the link is gone
+                self._serial = None                    # the link is gone
                 try:
                     ser.close()
                 except Exception:

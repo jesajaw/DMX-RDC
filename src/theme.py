@@ -1,23 +1,6 @@
-"""
-Theme
-=====
-
-One place for every ttk style used by the main window and Music Mode, so both look the same.
-apply_theme() is idempotent -- call it from any window.
-
-Style names:
-    Card.*        panels (frame, labels, checkbutton, scale) sitting on a slightly lighter background
-    Chip.Toolbutton  pill-shaped toggle (Checkbutton / Radiobutton with style="Chip.Toolbutton")
-    Accent.TButton / Blackout.TButton   primary and danger buttons
-"""
-
 from tkinter import ttk
 
 from . import config
-
-FONT = "Segoe UI"
-MONO = "Consolas"
-
 
 def _luminance(hex_colour: str) -> float:
     h = hex_colour.lstrip("#")
@@ -50,7 +33,7 @@ def apply_theme(widget) -> None:
 
     style = ttk.Style(widget)
     style.theme_use("clam")
-    style.configure(".", background=bg, foreground=fg, font=(FONT, 9), bordercolor=line,
+    style.configure(".", background=bg, foreground=fg, font=(config.FONT, 9), bordercolor=line,
                     lightcolor=bg, darkcolor=bg, focuscolor=bg, troughcolor=bg)
 
     # --- frames / labels
@@ -62,19 +45,19 @@ def apply_theme(widget) -> None:
     style.configure("Muted.TLabel", background=bg, foreground=muted)
     style.configure("CardMuted.TLabel", background=card, foreground=muted)
     style.configure("Hint.TLabel", background=card, foreground=muted)
-    style.configure("CardTitle.TLabel", background=card, foreground=accent2, font=(FONT, 9, "bold"))
-    style.configure("Group.TLabel", background=card, foreground=accent2, font=(FONT, 9, "bold"))
-    style.configure("Title.TLabel", background=bg, foreground=fg, font=(FONT, 15, "bold"))
-    style.configure("Subtitle.TLabel", background=bg, foreground=muted, font=(FONT, 9))
-    style.configure("Big.TLabel", background=card, foreground=fg, font=(FONT, 24, "bold"))
-    style.configure("Section.TLabel", background=card, foreground=fg, font=(FONT, 13, "bold"))
-    style.configure("Value.TLabel", background=card, foreground=status, font=(MONO, 9))
-    style.configure("Track.TLabel", background=bg, foreground=fg, font=(FONT, 12, "bold"))
-    style.configure("Artist.TLabel", background=bg, foreground=status, font=(FONT, 9))
+    style.configure("CardTitle.TLabel", background=card, foreground=accent2, font=(config.FONT, 9, "bold"))
+    style.configure("Group.TLabel", background=card, foreground=accent2, font=(config.FONT, 9, "bold"))
+    style.configure("Title.TLabel", background=bg, foreground=fg, font=(config.FONT, 15, "bold"))
+    style.configure("Subtitle.TLabel", background=bg, foreground=muted, font=(config.FONT, 9))
+    style.configure("Big.TLabel", background=card, foreground=fg, font=(config.FONT, 24, "bold"))
+    style.configure("Section.TLabel", background=card, foreground=fg, font=(config.FONT, 13, "bold"))
+    style.configure("Value.TLabel", background=card, foreground=status, font=(config.MONO, 9))
+    style.configure("Track.TLabel", background=bg, foreground=fg, font=(config.FONT, 12, "bold"))
+    style.configure("Artist.TLabel", background=bg, foreground=status, font=(config.FONT, 9))
     # old names, still used by the dialogs / main window cells
     style.configure("Cell.TFrame", background=card, bordercolor=line)
-    style.configure("Status.TLabel", background=card, foreground=status, font=(MONO, 9))
-    style.configure("CellTitle.TLabel", background=card, foreground=fg, font=(FONT, 9, "bold"))
+    style.configure("Status.TLabel", background=card, foreground=status, font=(config.MONO, 9))
+    style.configure("CellTitle.TLabel", background=card, foreground=fg, font=(config.FONT, 9, "bold"))
     style.configure("TLabelframe", background=bg, foreground=fg, bordercolor=line)
     style.configure("TLabelframe.Label", background=bg, foreground=accent)
     style.configure("TSeparator", background=line)
@@ -85,23 +68,23 @@ def apply_theme(widget) -> None:
     style.map("TButton", background=[("active", accent_dark), ("pressed", accent)],
               foreground=[("active", fg)], bordercolor=[("active", accent)])
     style.configure("Accent.TButton", background=accent, foreground=ink, bordercolor=accent, padding=(16, 7),
-                    font=(FONT, 9, "bold"))
+                    font=(config.FONT, 9, "bold"))
     style.map("Accent.TButton", background=[("active", accent2), ("pressed", accent_dark)],
               foreground=[("active", on_accent({"ACCENT": accent2}))])
     style.configure("Blackout.TButton", background=accent_dark, foreground=fg, bordercolor=accent_dark,
-                    padding=(16, 7), font=(FONT, 9, "bold"))
+                    padding=(16, 7), font=(config.FONT, 9, "bold"))
     style.map("Blackout.TButton", background=[("active", accent), ("pressed", accent2), ("selected", accent)],
               foreground=[("active", ink)])
 
     # --- pill toggles (Checkbutton / Radiobutton with style="Chip.Toolbutton")
     style.configure("Chip.Toolbutton", background=bg, foreground=muted, bordercolor=line, relief="flat",
-                    padding=(11, 5), font=(FONT, 9, "bold"), focuscolor=bg)
+                    padding=(11, 5), font=(config.FONT, 9, "bold"), focuscolor=bg)
     style.map("Chip.Toolbutton",
               background=[("selected", accent), ("active", accent_dark)],
               foreground=[("selected", ink), ("active", fg)],
               bordercolor=[("selected", accent), ("active", accent)])
     style.configure("Look.Toolbutton", background=card, foreground=fg, bordercolor=line, relief="flat",
-                    padding=(10, 6), font=(FONT, 9, "bold"), focuscolor=card)
+                    padding=(10, 6), font=(config.FONT, 9, "bold"), focuscolor=card)
     style.map("Look.Toolbutton",
               background=[("selected", accent), ("active", accent_dark)],
               foreground=[("selected", ink), ("active", fg)],
@@ -126,7 +109,7 @@ def apply_theme(widget) -> None:
     widget.option_add("*TCombobox*Listbox.foreground", fg)
     widget.option_add("*TCombobox*Listbox.selectBackground", accent_dark)
     widget.option_add("*TCombobox*Listbox.selectForeground", fg)
-    widget.option_add("*TCombobox*Listbox.font", (FONT, 9))
+    widget.option_add("*TCombobox*Listbox.font", (config.FONT, 9))
 
     # --- sliders: handle in the accent colour, dark groove
     for name, trough in (("Horizontal.TScale", card), ("Card.Horizontal.TScale", bg)):

@@ -2,42 +2,68 @@
 Engine
 ======
 
-The "logic": rules turn analysis Features into device states, devices turn into a DMX frame.
+The "logic": a mapping grid turns analysis Features into device states, devices turn into a DMX frame.
 
-    Rule = SOURCE + EVENT  ->  TARGET + ACTION
+    Mapping grid   rows = SOURCE (sub | bass | mids | highs | beat)      columns = what it does to the fixture
 
-    source   sub | bass | mids | highs        (a band)     or   beat
-    event    hit                              the band had an onset
-             above / below                    the band's level crosses `threshold` (0..1, with hysteresis)
-             (beat)                           every `every_beats` beats
-    target   led.on  led.pattern  derby.on  derby.colour  derby.position  laser.on  laser.colour  laser.rotation
-    action   set     -> values[0]
-             toggle  -> values[0], values[1], values[0], ...     (e.g. position 0 / 127)
-             cycle   -> through values (or all of the target's cycle options when `values` is empty)
-    extras   hold_ms      after this long the target goes back to what it was (a blink); 0 = stays
-             cooldown_ms  minimum time between two firings of this rule (e.g. for the slow derby position)
+        flash columns  (3 states per cell: -  /  ON  /  OFF)
+            LED  Derby  Laser      ON  = the device lights up for FLASH_HOLD_MS on every hit of that source
+                                   OFF = the device goes dark for FLASH_HOLD_MS on every hit (it is on in between)
+        change columns (2 states per cell: -  /  cycle)
+            LED pattern, Derby colour, Laser colour, Derby swing, Laser spin
+                                   every hit steps to the next pattern / colour / position / direction
 
-Every rule works on its own and every target can be driven by any number of rules; when two rules
-write the same target the later write wins. "BASS -> ON" and "BASS -> OFF" are simply two rules.
+    The beat row fires on every `beat_every` beats instead of on a band hit.
 
-A Look is a list of rules plus the start state of the devices. The engine knows nothing about audio
-libraries or the GUI: process(features) -> {channel: value} for channels 1..9 (channel 1 is always 0).
+    Under the hood every non-empty cell is one Rule (SOURCE + EVENT -> TARGET + ACTION, with hold and minimum gap);
+    build_rules() generates them from the grid, so the grid is the only thing the UI edits. Rule, Target and
+    LightEngine._fire know nothing about the grid.
+
+    Extra: "Bouncy Bass" -- every bass hit throws the derby motor between BOUNCE_POS_MIN and BOUNCE_POS_MAX. When
+    the kicks come faster than the motor can travel (config.BOUNCE_TRAVEL_S) only every 2nd (3rd, ...) kick bounces.
+
+A Look is a grid plus the start state of the devices. The engine knows nothing about audio libraries or the GUI:
+process(features) -> {channel: value} for channels 1..9 (channel 1 is always 0).
 """
 
 import itertools
+import math
 from dataclasses import dataclass, field, replace
 
 from ..fixture import CHANNELS, DERBY_COLOURS, LASER_COLOURS, PATTERN_COUNT, POSITION_MAX, Fixture
 from . import config
 
-# --------- Rule vocabulary (key, label) -- what the UI offers
+# --------- Vocabulary of the mapping grid
 SOURCES = [("sub", "Sub"), ("bass", "Bass"), ("mids", "Mids"), ("highs", "Highs"), ("beat", "Beat")]
-BAND_EVENTS = [("hit", "hit"), ("above", "rises above"), ("below", "falls below")]
-ACTIONS = [("set", "set"), ("toggle", "toggle A \u21c4 B"), ("cycle", "cycle")]
 BEAT_OPTIONS = {"1 beat": 1, "2 beats": 2, "1 bar": 4, "2 bars": 8, "4 bars": 16, "8 bars": 32}
-HOLD_OPTIONS_MS = (0, 60, 100, 150, 250, 500, 1000)
-GAP_OPTIONS_MS = (0, 100, 250, 500, 1000)
-THRESHOLD_OPTIONS = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+
+@dataclass(frozen=True)
+class Column:
+    key: str
+    label: str
+    kind: str                # "switch": - / on / off      "cycle": - / cycle
+    target: str              # key into TARGETS
+    group: str               # header over the column
+
+
+COLUMNS = (
+    Column("led", "LED", "switch", "led.on", "flash"),
+    Column("derby", "Derby", "switch", "derby.on", "flash"),
+    Column("laser", "Laser", "switch", "laser.on", "flash"),
+    Column("led.pattern", "LED\npattern", "cycle", "led.pattern", "change"),
+    Column("derby.colour", "Derby\ncolour", "cycle", "derby.colour", "change"),
+    Column("laser.colour", "Laser\ncolour", "cycle", "laser.colour", "change"),
+    Column("derby.position", "Derby\nswing", "cycle", "derby.position", "change"),
+    Column("laser.rotation", "Laser\nspin", "cycle", "laser.rotation", "change"),
+)
+COLUMN_BY_KEY = {c.key: c for c in COLUMNS}
+STATES = {"switch": ("", "on", "off"), "cycle": ("", "cycle")}
+
+
+def cell_key(source: str, column: str) -> str:
+    return f"{source}.{column}"
+
 
 _uid = itertools.count(1)
 
@@ -94,63 +120,91 @@ def value_label(target: str, value) -> str:
 # --------- Looks
 @dataclass
 class Look:
-    """Rules plus the start state of the devices. The UI edits these fields directly."""
+    """A mapping grid plus the start state of the devices. The UI edits grid / beat_every directly."""
     name: str
     description: str = ""
-    rules: list = field(default_factory=list)
+    grid: dict = field(default_factory=dict)          # "bass.led" -> "on" | "off" | "cycle"  (missing = nothing)
+    beat_every: int = 4                               # the beat row fires every this many beats
     initial: dict = field(default_factory=dict)       # target key -> value at the start of every song
 
     def copy(self, **changes) -> "Look":
-        return replace(self, rules=[replace(r) for r in self.rules], initial=dict(self.initial), **changes)
+        return replace(self, grid=dict(self.grid), initial=dict(self.initial), **changes)
 
 
-def _r(source, event, target, action="set", *values, thr=0.6, every=4, hold=0, gap=0) -> Rule:
-    return Rule(source=source, event=event, target=target, action=action, values=tuple(values),
-                threshold=thr, every_beats=every, hold_ms=hold, cooldown_ms=gap)
+def _grid(*cells) -> dict:
+    """_grid("bass.led=on", "beat.led.pattern=cycle") -> {"bass.led": "on", "beat.led.pattern": "cycle"}"""
+    return dict(cell.split("=") for cell in cells)
 
 
-# One-click starting points, shown as chips in Music Mode. Everything can be changed afterwards.
+# One-click starting points, shown as buttons in Music Mode. Everything can be changed afterwards.
 QUICK_LOOKS = [
-    Look("Kick Flash", "LED flashes on every bass hit, its pattern changes every bar; the derby swings on the sub.",
-         rules=[
-             _r("bass", "hit", "led.on", "set", True, hold=120),
-             _r("beat", "beat", "led.pattern", "cycle", every=4),
-             _r("beat", "beat", "derby.colour", "cycle", "blue", "white", "red_blue", every=4),
-             _r("sub", "hit", "derby.position", "toggle", 10, 110, gap=300),
-             _r("beat", "beat", "laser.rotation", "toggle", "cw", "ccw", every=16),
-         ],
+    Look("Kick Flash", "LED flashes on every bass hit, its pattern changes every 2 bars; the derby swings on the sub.",
+         grid=_grid("bass.led=on", "beat.led.pattern=cycle", "beat.derby.colour=cycle",
+                    "sub.derby.position=cycle", "beat.laser.rotation=cycle"),
+         beat_every=8,
          initial={"led.pattern": 3, "derby.on": True, "derby.colour": "blue", "laser.on": True,
                   "laser.colour": "green", "laser.rotation": "cw"}),
     Look("Colour Pulse", "Every bass hit flashes the LED and steps the derby to the next colour; highs flip the laser colour.",
-         rules=[
-             _r("bass", "hit", "led.on", "set", True, hold=100),
-             _r("bass", "hit", "led.pattern", "cycle"),
-             _r("bass", "hit", "derby.colour", "cycle", "red", "blue", "green", "white"),
-             _r("highs", "hit", "laser.colour", "toggle", "green", "red", gap=250),
-         ],
+         grid=_grid("bass.led=on", "bass.led.pattern=cycle", "bass.derby.colour=cycle", "highs.laser.colour=cycle"),
          initial={"derby.on": True, "derby.colour": "red", "laser.on": True, "laser.rotation": "cw"}),
-    Look("Sub Swing", "Sub hits swing the derby between two positions, bass flashes it, the laser follows the mids.",
-         rules=[
-             _r("sub", "hit", "derby.position", "toggle", 0, 127, gap=250),
-             _r("bass", "hit", "derby.on", "set", True, hold=140),
-             _r("mids", "above", "laser.on", "set", True, thr=0.6),
-             _r("mids", "below", "laser.on", "set", False, thr=0.6),
-             _r("beat", "beat", "led.pattern", "cycle", every=8),
-         ],
+    Look("Sub Swing", "Sub hits swing the derby between two positions, bass flashes it, mids flash the laser.",
+         grid=_grid("sub.derby.position=cycle", "bass.derby=on", "mids.laser=on", "beat.led.pattern=cycle"),
+         beat_every=8,
          initial={"led.on": True, "led.pattern": 5, "derby.colour": "white", "laser.colour": "red_green",
                   "laser.rotation": "ccw"}),
-    Look("Ambient", "No reaction to single hits: steady light, slow changes every 2 to 4 bars.",
-         rules=[
-             _r("beat", "beat", "led.pattern", "cycle", every=8),
-             _r("beat", "beat", "derby.colour", "cycle", "blue", "green_blue", "red_blue", "white", every=16),
-             _r("beat", "beat", "laser.rotation", "toggle", "cw", "ccw", every=32),
-         ],
+    Look("Ambient", "No reaction to single hits: steady light, slow changes every 4 bars.",
+         grid=_grid("beat.led.pattern=cycle", "beat.derby.colour=cycle", "beat.laser.rotation=cycle"),
+         beat_every=16,
          initial={"led.on": True, "led.pattern": 3, "derby.on": True, "derby.colour": "blue",
                   "laser.on": True, "laser.colour": "green", "laser.rotation": "cw"}),
 ]
 BY_NAME = {look.name: look for look in QUICK_LOOKS}
 DEFAULT = QUICK_LOOKS[0]
 CUSTOM = "Custom"
+
+# What a "cycle" cell does: (action, values, minimum gap in ms). () = through everything the target offers.
+_CYCLES = {
+    "led.pattern": ("cycle", (), config.CYCLE_GAP_MS),
+    "derby.colour": ("cycle", tuple(config.DERBY_CYCLE_COLOURS), config.CYCLE_GAP_MS),
+    "laser.colour": ("cycle", tuple(config.LASER_CYCLE_COLOURS), config.CYCLE_GAP_MS),
+    "derby.position": ("toggle", tuple(config.SWING_POSITIONS), config.SWING_GAP_MS),
+    "laser.rotation": ("toggle", ("cw", "ccw"), config.CYCLE_GAP_MS),
+}
+
+
+def build_rules(look: Look) -> list:
+    """Every non-empty grid cell becomes one Rule. The uid depends only on the cell, so the cycle / toggle
+    counters survive an edit of some other cell."""
+    rules = []
+    for si, (source, _) in enumerate(SOURCES):
+        for ci, column in enumerate(COLUMNS):
+            state = look.grid.get(cell_key(source, column.key), "")
+            if state not in STATES[column.kind] or not state:
+                continue
+            common = dict(source=source, event="beat" if source == "beat" else "hit",
+                          every_beats=look.beat_every, uid=1000 + si * 50 + ci)
+            if column.kind == "switch":
+                rules.append(Rule(target=column.target, action="set", values=(state == "on",),
+                                  hold_ms=config.FLASH_HOLD_MS, **common))
+            else:
+                action, values, gap = _CYCLES[column.key]
+                rules.append(Rule(target=column.target, action=action, values=values,
+                                  cooldown_ms=0 if source == "beat" else gap, **common))
+    return rules
+
+
+def baseline(look: Look) -> dict:
+    """Start state: the look's own, except that a device with flash cells rests in the opposite state
+    (ON cells -> dark in between, OFF cells -> lit in between)."""
+    out = dict(look.initial)
+    for device in ("led", "derby", "laser"):
+        states = {look.grid.get(cell_key(source, device)) for source, _ in SOURCES}
+        if "on" in states:
+            out[f"{device}.on"] = False
+        elif "off" in states:
+            out[f"{device}.on"] = True
+    return out
+
 
 _OFF_FRAME = {ch: 0 for ch in CHANNELS}
 
@@ -168,6 +222,11 @@ class LightEngine:
     def __init__(self, look: Look):
         self.look = look
         self.force_blackout = False      # the Blackout button: everything dark, whatever the rules say
+        self.bouncy = False              # "Bouncy Bass" checkbox
+        self._rules = build_rules(look)
+        self._bounce_n = 0
+        self._bounce_hi = False
+        self._bounce_t = -1e9
         self.fixture = Fixture()
         self._t = 0.0
         self._active = False
@@ -178,7 +237,16 @@ class LightEngine:
 
     def set_look(self, look: Look) -> None:
         self.look = look
+        self._rules = build_rules(look)
         self._reset_state()
+
+    def rebuild(self) -> None:
+        """The grid was edited: regenerate the rules (cycle counters stay) and re-rest the on/off devices."""
+        self._rules = build_rules(self.look)
+        for key, value in baseline(self.look).items():
+            if key.endswith(".on"):
+                self._pending = {k: v for k, v in self._pending.items() if k[0] != key}
+                self._apply(key, value)
 
     # ---- device state
     def _reset_state(self) -> None:
@@ -186,7 +254,8 @@ class LightEngine:
         self._rs.clear()
         self._pending.clear()
         self._owner.clear()
-        for key, value in self.look.initial.items():
+        self._bounce_n, self._bounce_hi, self._bounce_t = 0, False, -1e9
+        for key, value in baseline(self.look).items():
             if key in TARGETS:
                 self._apply(key, value)
 
@@ -208,7 +277,7 @@ class LightEngine:
         self._active = True
 
         self._run_reverts()
-        for rule in tuple(self.look.rules):          # snapshot: the GUI may edit the list meanwhile
+        for rule in self._rules:                     # the GUI swaps the whole list, never edits it in place
             state = self._rs.setdefault(rule.uid, _RuleState())
             if not self._fires(rule, state, f):
                 continue
@@ -216,7 +285,25 @@ class LightEngine:
                 continue
             state.last = self._t
             self._fire(rule, state)
+        if self.bouncy and f.hit.get("bass"):
+            self._bounce(f)
         return dict(_OFF_FRAME) if self.force_blackout else self.fixture.dmx()
+
+    # ---- Bouncy Bass
+    def _bounce(self, f) -> None:
+        """Throw the derby between its two end positions on the kick -- but only as often as the motor can follow:
+        if the kicks come faster than config.BOUNCE_TRAVEL_S, every 2nd (3rd, ...) kick bounces."""
+        interval = f.kick_interval if f.kick_interval > 0 else 60.0 / max(f.bpm, 1.0)
+        stride = max(1, math.ceil(config.BOUNCE_TRAVEL_S / max(interval, 0.05)))
+        self._bounce_n += 1
+        if self._bounce_n % stride:
+            return
+        if self._t - self._bounce_t < 0.8 * config.BOUNCE_TRAVEL_S:          # jitter guard
+            return
+        self._bounce_t = self._t
+        self._bounce_hi = not self._bounce_hi
+        self._apply("derby.position", config.BOUNCE_POS_MAX if self._bounce_hi else config.BOUNCE_POS_MIN)
+        self._owner["derby.position"] = -1
 
     # ---- rules
     def _fires(self, rule: Rule, state: _RuleState, f) -> bool:

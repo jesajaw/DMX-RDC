@@ -75,11 +75,6 @@ class DMXUI:
         bar.grid(row=0, column=0, sticky="ew")
         bar.columnconfigure(1, weight=1)
 
-        titles = ttk.Frame(bar)
-        titles.grid(row=0, column=0, sticky="w")
-        ttk.Label(titles, text="DMX DERBY CONTROLLER", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(titles, text="Varytec Razor Derby  \u00b7  9-channel mode", style="Subtitle.TLabel").pack(anchor="w")
-
         controls = ttk.Frame(bar)
         controls.grid(row=0, column=2, sticky="e")
 
@@ -114,7 +109,7 @@ class DMXUI:
         grid.rowconfigure(4, weight=1)
 
         for col, group in enumerate(fixture.DEVICES):
-            ttk.Label(grid, text=group.title.upper(), style="Subtitle.TLabel", font=(theme.FONT, 9, "bold"),
+            ttk.Label(grid, text=group.title.upper(), style="Subtitle.TLabel", font=(config.FONT, 9, "bold"),
                       foreground=config.ACTIVE_SCHEME["ACCENT2"]).grid(row=0, column=col, sticky="w", padx=6, pady=(0, 6))
             if group.key == "led":
                 self._build_led_card(grid, row=1, col=col, rowspan=3, channel=group.channels[0])
@@ -153,7 +148,6 @@ class DMXUI:
     def _build_led_card(self, parent, row: int, col: int, rowspan: int, channel: int) -> None:
         card = self._card(parent, row, col, rowspan)
         self._channel_block(card, channel).grid(row=0, column=0, sticky="ew")
-        ttk.Label(card, text="QUICK PICK", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 6))
         chips = ttk.Frame(card, style="Plain.Card.TFrame")
         chips.grid(row=2, column=0, sticky="ew")
         per_row = 6
@@ -170,7 +164,7 @@ class DMXUI:
     def _build_auto_card(self, parent, row: int, col: int) -> None:
         card = self._card(parent, row, col)
         ttk.Label(card, text="AUTOMATIC PROGRAMS", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(card, text="The fixture's own shows. Show Select 0 = control the channels yourself.",
+        ttk.Label(card, text="The fixture's own shows. Select 0 to control the channels yourself.",
                   style="CardMuted.TLabel", wraplength=300, justify="left").grid(row=1, column=0, sticky="w", pady=(2, 8))
         for i, channel in enumerate(fixture.AUTO.channels):
             self._channel_block(card, channel).grid(row=2 + i, column=0, sticky="ew", pady=(0, 6))
@@ -178,10 +172,8 @@ class DMXUI:
     def _build_music_card(self, parent, row: int, col: int) -> None:
         card = self._card(parent, row, col)
         ttk.Label(card, text="MUSIC MODE", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(card, text="Lights that react to the music: bass hits, colour changes, strobe.",
-                  style="CardMuted.TLabel", wraplength=240, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 8))
-        ttk.Button(card, text="\U0001f3b5  Open Music Mode", command=self._open_music_mode,
-                   style="Accent.TButton").grid(row=2, column=0, sticky="ew")
+
+        ttk.Button(card, text="\U0001f3b5  Open Music Mode", command=self._open_music_mode, style="Accent.TButton").grid(row=2, column=0, sticky="ew")
 
     def _build_preset_card(self, parent, row: int, col: int) -> None:
         card = self._card(parent, row, col)

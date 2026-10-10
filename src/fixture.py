@@ -1,23 +1,17 @@
 """
-Fixture
-=======
-
 The ONE place that knows the Varytec Razor Derby in its 9-channel mode (see the manual in the project root).
-The manual window, Music Mode and the controller all take their channel names, device groups, colour ranges
-and value texts from here -- nothing about the channel layout is defined anywhere else.
+The manual window, Music Mode and the controller all take their channel names, device groups, colour ranges and value texts from here -- nothing about the channel layout is defined anywhere else.
 
-    Derby   Ch3 colour   Ch4 strobe   Ch5 motor
+    Derby   Ch3 colour, Ch4 strobe, Ch5 motor
     LED     Ch6 pattern
-    Laser   Ch7 colour   Ch8 strobe   Ch9 rotation
-    Auto    Ch1 show select   Ch2 speed       (the fixture's own automatic programs)
+    Laser   Ch7 colour, Ch8 strobe, Ch9 rotation
+    Auto    Ch1 show select, Ch2 speed
 
 Three parts:
-    1. the channel table      (names, which device a channel belongs to, describe(channel, value))
-    2. colour / pattern / position tables  (one range per entry; the DMX value sent is the middle of it)
-    3. the device states      (Led, Derby, Laser, Fixture) that render themselves to {channel: value};
-                              this is what Music Mode's engine drives
+    1. the channel table                    (names, which device a channel belongs to, describe(channel, value))
+    2. colour / pattern / position tables   (one range per entry; the DMX value sent is the middle of it)
+    3. the device states                    (Led, Derby, Laser, Fixture) that render themselves to {channel: value}; this is what Music Mode's engine drives
 
-No audio, no GUI, no timing in here.
 """
 
 from dataclasses import dataclass, field
@@ -25,20 +19,21 @@ from dataclasses import dataclass, field
 CHANNEL_COUNT = 9
 CHANNELS = tuple(range(1, CHANNEL_COUNT + 1))
 
-CH_SHOW_SELECT, CH_SPEED = 1, 2
+CH_AUTO, CH_SPEED = 1, 2
 CH_DERBY_COLOUR, CH_DERBY_STROBE, CH_DERBY_MOTOR = 3, 4, 5
 CH_LED_PATTERN = 6
 CH_LASER_COLOUR, CH_LASER_STROBE, CH_LASER_ROTATION = 7, 8, 9
 
 
-def _clamp(x: int, lo: int, hi: int) -> int:
-    return lo if x < lo else hi if x > hi else x
+def _clamp(x: int, low: int, high: int) -> int:
+    return low if x < low else high if x > high else x
 
 
 # =====================================================================================
 # 1. Channels and devices
+# number -> short name
 # =====================================================================================
-# number -> short name. The device header in the window supplies the rest ("Derby" / "Colour").
+
 CHANNEL_NAMES = {
     1: "Show Select", 2: "Speed",
     3: "Color", 4: "Strobe", 5: "Motor",
@@ -54,7 +49,7 @@ class Group:
     channels: tuple
 
 
-AUTO = Group("auto", "Automatic", (CH_SHOW_SELECT, CH_SPEED))
+AUTO = Group("auto", "Automatic", (CH_AUTO, CH_SPEED))
 DEVICES = (
     Group("derby", "Derby", (CH_DERBY_COLOUR, CH_DERBY_STROBE, CH_DERBY_MOTOR)),
     Group("led", "LED", (CH_LED_PATTERN,)),
@@ -67,28 +62,28 @@ def channel_title(channel: int) -> str:
 
 
 # =====================================================================================
-# 2. Value tables (from the manual)
+# 2. Value tables
 # =====================================================================================
 @dataclass(frozen=True)
 class Colour:
     key: str
     label: str
-    lo: int
-    hi: int
-    auto: bool = False       # the fixture changes colour by itself (speed not controllable)
+    low: int # first value...
+    high: int # last value for the dmx setting
+    auto: bool = False # the fixture changes colour by itself (speed not controllable, may needs to be measured)
 
     @property
     def dmx(self) -> int:
-        """The value we send: the middle of the colour's range."""
-        return (self.lo + self.hi + 1) // 2
+        # value we send: middle of the settings range
+        return (self.low + self.high + 1) // 2
 
 
 def _colours(first: int, entries) -> dict:
-    """entries: (key, label, last value of the range[, auto]); every range starts after the previous one."""
-    out, lo = {}, first
-    for key, label, hi, *auto in entries:
-        out[key] = Colour(key, label, lo, hi, bool(auto and auto[0]))
-        lo = hi + 1
+    # entries: (key, label, last value of the range[, auto]); every range starts after the previous one
+    out, low = {}, first
+    for key, label, high, *auto in entries:
+        out[key] = Colour(key, label, low, high, bool(auto and auto[0]))
+        low = high + 1
     return out
 
 
@@ -117,7 +112,7 @@ def pattern_dmx(n: int) -> int:
 
 
 def pattern_of(value: int) -> int:
-    """Pattern number (1..18) a Ch6 value selects; 0 = blackout."""
+    # LED pattern number (1..18) a Ch6 value selects; 0 = blackout."""
     return 0 if value <= 9 else min(PATTERN_COUNT, (value - 10) // 10 + 1)
 
 
@@ -131,7 +126,7 @@ LASER_ROTATION = {"stop": 0, "cw": LASER_CW_VALUE, "ccw": LASER_CCW_VALUE}
 
 
 # =====================================================================================
-# describe(): channel value -> readable text, for the sliders of the manual window
+# describe(): channel value -> readable text
 # =====================================================================================
 def _steps(*pairs):
     return tuple(pairs)
@@ -140,13 +135,13 @@ def _steps(*pairs):
 _SHOW = _steps((9, "Manual (Blackout/Ch.3 active)"), (44, "Derby + Laser + Strobe"), (79, "Derby + Strobe"),
                (114, "Derby + Laser"), (149, "Laser + Strobe"), (184, "Derby Effect"), (219, "Laser Effect"),
                (255, "Strobe Effect"))
-_DERBY_COLOUR = _steps((5, "Off"), *((c.hi, c.label) for c in DERBY_COLOURS.values()))
-_LASER_MODE = _steps((9, "Laser Off"), *((c.hi, c.label) for c in LASER_COLOURS.values()), *_LASER_STROBE_STEPS)
+_DERBY_COLOUR = _steps((5, "Off"), *((c.high, c.label) for c in DERBY_COLOURS.values()))
+_LASER_MODE = _steps((9, "Laser Off"), *((c.high, c.label) for c in LASER_COLOURS.values()), *_LASER_STROBE_STEPS)
 
 
 def _pick(table, value: int) -> str:
-    for hi, label in table:
-        if value <= hi:
+    for high, label in table:
+        if value <= high:
             return label
     return table[-1][1]
 
@@ -176,12 +171,12 @@ def describe(channel: int, value) -> str:
 
 
 # =====================================================================================
-# 3. Device states (what Music Mode's engine drives)
+# 3. Device states
 # =====================================================================================
 @dataclass
 class Led:
     on: bool = False
-    pattern: int = 1                     # 1..PATTERN_COUNT; kept while the LED is off
+    pattern: int = 1 # 1..PATTERN_COUNT; kept while the LED is off
 
     def set(self, attr: str, value) -> None:
         if attr == "on":
@@ -246,7 +241,7 @@ class Laser:
 
 @dataclass
 class Fixture:
-    """All three devices. set("derby.colour", "blue") / get(...) address one property, dmx() is the whole frame."""
+    # all three devices. set("derby.colour", "blue") / get(...) address one property, dmx() is the whole frame
     led: Led = field(default_factory=Led)
     derby: Derby = field(default_factory=Derby)
     laser: Laser = field(default_factory=Laser)
@@ -260,7 +255,7 @@ class Fixture:
         return getattr(getattr(self, device), attr)
 
     def dmx(self) -> dict:
-        frame = {ch: 0 for ch in CHANNELS}           # channels nobody drives (Ch1, 2, 4, 8) stay 0
+        frame = {ch: 0 for ch in CHANNELS} # channels nobody drives (Ch1, 2, 4, 8) stay 0
         for device in (self.led, self.derby, self.laser):
             frame.update(device.dmx())
         return frame
