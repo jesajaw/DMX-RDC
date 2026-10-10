@@ -1,2 +1,1 @@
-from . import config, controller, lightengine, musicmode, theme, ui
-__all__ = ["config", "controller", "lightengine", "musicmode", "theme", "ui"]
+"""DMX Derby Controller -- main window (app), DMX link (controller), theme, config and the musicmode package."""
