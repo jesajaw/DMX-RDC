@@ -457,8 +457,10 @@ class MusicModeWindow(tk.Toplevel):
             r = r_in + 3 + (1.0 + db / config.DB_RANGE_BARS) * max_len
             canvas.coords(ring, cx - r, cy - r, cx + r, cy + r)
             canvas.coords(text, cx, cy - r)
-            x0, y0, x1, y1 = canvas.bbox(text)
-            canvas.coords(bg_item, x0 - 3, y0 - 1, x1 + 3, y1 + 1)
+            box = canvas.bbox(text)
+            if box:
+                x0, y0, x1, y1 = box
+                canvas.coords(bg_item, x0 - 3, y0 - 1, x1 + 3, y1 + 1)
         r_out = r_in + max_len + 6
         for (hz, theta), (right, left), label in zip(self._ticks, self._tick_lines, self._tick_labels):
             a = math.radians(theta)
@@ -561,10 +563,12 @@ class MusicModeWindow(tk.Toplevel):
         anchor, tx = ("e", mouse[0] - 12) if dx > 0 else ("w", mouse[0] + 12)
         canvas.itemconfig(self._cur_text, text=f"{_hz_text(self._theta_freq(theta))}   {db:.0f} dB", anchor=anchor)
         canvas.coords(self._cur_text, tx, mouse[1] - 14)
-        x0, y0, x1, y1 = canvas.bbox(self._cur_text)
-        canvas.coords(self._cur_bg, x0 - 4, y0 - 2, x1 + 4, y1 + 2)
-        for item in items:
+        for item in items:                               # show first: bbox() of a hidden item is None
             canvas.itemconfig(item, state="normal")
+        box = canvas.bbox(self._cur_text)
+        if box:
+            x0, y0, x1, y1 = box
+            canvas.coords(self._cur_bg, x0 - 4, y0 - 2, x1 + 4, y1 + 2)
         canvas.tag_raise(self._cur_ray)
         canvas.tag_raise(self._cur_dot)
         canvas.tag_raise(self._cur_bg)
