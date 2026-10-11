@@ -1,6 +1,7 @@
 # DMX Derby Controller
 
-A small UI to control a DMX derby/laser fixture over a USB-DMX adapter -- one slider per channel, live plain-text readout of what each value actually does, Blackout and a Music Mode.
+This was built because I didn't want to buy a massive lighting controller just to run one DMX derby/laser fixture.
+This is a lightweight UI that runs over a USB-DMX adapter so you can bypass confusing remote control auto-modes and actually control the lights yourself. I also added experimental live music analysis -- though obviously it's not the same experience as a real human preparing before a show starts.
 
 ## 🚀 Features
 
