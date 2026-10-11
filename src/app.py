@@ -170,10 +170,66 @@ class DMXUI:
             self._channel_block(card, channel).grid(row=2 + i, column=0, sticky="ew", pady=(0, 6))
 
     def _build_music_card(self, parent, row: int, col: int) -> None:
-        card = self._card(parent, row, col)
-        ttk.Label(card, text="MUSIC MODE", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        """The whole cell is one big button: hover lights it up, a click opens Music Mode."""
+        c = config.ACTIVE_SCHEME
+        idle = c["BG_LIGHT"]
+        hover = theme.lerp_colour(c["BG_LIGHT"], c["ACCENT"], 0.30)
+        pressed = c["ACCENT_DARK"]
 
-        ttk.Button(card, text="\U0001f3b5  Open Music Mode", command=self._open_music_mode, style="Accent.TButton").grid(row=2, column=0, sticky="ew")
+        cell = tk.Frame(parent, bg=idle, cursor="hand2", takefocus=1,
+                        highlightthickness=1, highlightbackground=c["LINE"], highlightcolor=c["ACCENT2"])
+        cell.grid(row=row, column=col, padx=6, pady=5, sticky="nsew")
+        cell.columnconfigure(0, weight=1)
+        cell.rowconfigure(1, weight=1)
+
+        title = tk.Label(cell, text="MUSIC MODE", bg=idle, fg=c["ACCENT2"], font=(config.FONT, 9, "bold"), cursor="hand2")
+        title.grid(row=0, column=0, sticky="w", padx=14, pady=(10, 0))
+        centre = tk.Frame(cell, bg=idle, cursor="hand2")
+        centre.grid(row=1, column=0)
+        icon = tk.Label(centre, text="\U0001f3b5", bg=idle, fg=c["ACCENT"], font=(config.FONT, 34), cursor="hand2")
+        icon.pack()
+        action = tk.Label(centre, text="Open Music Mode", bg=idle, fg=c["FG"], font=(config.FONT, 13, "bold"), cursor="hand2")
+        action.pack(pady=(4, 0))
+        hint = tk.Label(centre, text="audio-reactive lighting", bg=idle, fg=c["MUTED"], font=(config.FONT, 9), cursor="hand2")
+        hint.pack(pady=(2, 14))
+
+        parts = (cell, title, centre, icon, action, hint)
+
+        def paint(colour: str, border: str) -> None:
+            for w in parts:
+                w.configure(bg=colour)
+            cell.configure(highlightbackground=border)
+
+        def inside(event) -> bool:
+            w = cell.winfo_containing(event.x_root, event.y_root)
+            return w in parts
+
+        def on_enter(_event) -> None:
+            paint(hover, c["ACCENT"])
+
+        def on_leave(event) -> None:
+            if not inside(event):                     # moving between the cell's own labels is not leaving
+                paint(idle, c["LINE"])
+
+        def on_press(_event) -> None:
+            paint(pressed, c["ACCENT2"])
+
+        def on_release(event) -> None:
+            if inside(event):
+                paint(hover, c["ACCENT"])
+                self._open_music_mode()
+            else:
+                paint(idle, c["LINE"])
+
+        for w in parts:
+            w.bind("<Enter>", on_enter, add="+")
+            w.bind("<Leave>", on_leave, add="+")
+            w.bind("<ButtonPress-1>", on_press, add="+")
+            w.bind("<ButtonRelease-1>", on_release, add="+")
+        cell.bind("<Return>", lambda e: self._open_music_mode())
+        cell.bind("<space>", lambda e: self._open_music_mode())
+        cell.bind("<FocusIn>", lambda e: cell.configure(highlightbackground=c["ACCENT2"]))
+        cell.bind("<FocusOut>", lambda e: cell.configure(highlightbackground=c["LINE"]))
 
     def _build_preset_card(self, parent, row: int, col: int) -> None:
         card = self._card(parent, row, col)

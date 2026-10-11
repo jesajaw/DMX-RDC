@@ -177,9 +177,8 @@ Each preset is a plain JSON file: `presets/<name>.json`:
 
 ## Limitations
 
-- DMX512 is a unidirectional protocol: the controller has no way to confirm that a fixture is actually receiving data, only that the USB-DMX adapter itself is reachable over serial.
-- **Windows** is the primary, fully-tested platform (generic FTDI-based USB-DMX adapter).
-- **Linux**: connecting to an FTDI USB-DMX adapter and sending channels works (see the udev rule above). Music Mode's audio capture (PulseAudio/PipeWire loopback) and Now Playing (MPRIS via `jeepney`) are less tested. If audio capture or Now Playing don't pick anything up, check `pactl list sources short` for your monitor source name, and `busctl --user list | grep mpris` for an active MPRIS player -- `_discover` in `src/musicmode/audio_source.py` and `_fetch_mpris_metadata` in `src/musicmode/nowplaying.py` are the places to adjust if the exact names differ on your system. -- TODO!
+DMX512 is a unidirectional protocol: The controller has no way of verifying whether a device is actually receiving data; it can only check whether the USB-DMX adapter itself is accessible via the serial interface. And anyway, I don't think you can use this script for other devices because of the different channels; that might be the biggest limitation :/
+
 
 ## 📜 License
 

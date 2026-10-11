@@ -259,8 +259,9 @@ class MusicModeWindow(tk.Toplevel):
         left = ttk.Frame(self)
         left.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=(16, 8))
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(1, weight=1)
-        self._build_visual(left)
+        left.rowconfigure(1, weight=1)                  # the disc takes whatever height is left
+        self._build_visual(left)                        # rows 0 (now playing card) and 1 (disc)
+        self._build_tuning(left, 2)                     # sits under the disc, so both columns end at the same height
 
         right = ttk.Frame(self)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(16, 8))
@@ -269,7 +270,6 @@ class MusicModeWindow(tk.Toplevel):
         self._build_looks(right, 1)
         self._build_mapping(right, 2)
         self._build_extras(right, 3)
-        self._build_tuning(right, 4)
         self._load_look(self.look.name)
 
         footer = ttk.Frame(self)
@@ -296,8 +296,7 @@ class MusicModeWindow(tk.Toplevel):
     # --------- Left side: now playing + the cover with the frequency bands around it + waveform
     def _build_visual(self, parent: ttk.Frame) -> None:
         colors = self.colors
-        head = ttk.Frame(parent)
-        head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        head = self._card(parent, "Now playing", 0)
         self.track_label = ttk.Label(head, text="", style="Track.TLabel", wraplength=480)
         self.track_label.pack(anchor="w")
         self.artist_label = ttk.Label(head, text="", style="Artist.TLabel", wraplength=480)
@@ -306,7 +305,7 @@ class MusicModeWindow(tk.Toplevel):
         size = config.VIZ_MIN_SIZE
         self.disc_canvas = tk.Canvas(parent, width=size, height=size, bg=colors["BG_LIGHT"],
                                      highlightthickness=1, highlightbackground=colors["LINE"])
-        self.disc_canvas.grid(row=1, column=0, sticky="nsew")
+        self.disc_canvas.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         canvas = self.disc_canvas
         bg = colors["BG_LIGHT"]
 
@@ -681,7 +680,7 @@ class MusicModeWindow(tk.Toplevel):
 
     # --------- Right side: extras (checkboxes)
     def _build_extras(self, parent: ttk.Frame, row: int) -> None:
-        box = self._card(parent, "Extras", row)
+        box = self._card(parent, "Extras", row, pady=(0, 0))
         box.columnconfigure(0, weight=1)
         self.bouncy_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(box, text="Bouncy Bass", style="Card.TCheckbutton", variable=self.bouncy_var,

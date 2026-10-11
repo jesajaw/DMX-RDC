@@ -26,7 +26,7 @@ src/out/
 # Runtime cache of NowPlayingBridge (title/artist/album/cover cache)
 src/nowplaying_cache/
 # and music profiles at all
-*.json
+src/musicmode/*.json
 
 # Logs & Generated Runtime Files
 *.log

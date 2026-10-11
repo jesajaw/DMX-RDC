@@ -52,8 +52,8 @@ def apply_theme(widget) -> None:
     style.configure("Big.TLabel", background=card, foreground=fg, font=(config.FONT, 24, "bold"))
     style.configure("Section.TLabel", background=card, foreground=fg, font=(config.FONT, 13, "bold"))
     style.configure("Value.TLabel", background=card, foreground=status, font=(config.MONO, 9))
-    style.configure("Track.TLabel", background=bg, foreground=fg, font=(config.FONT, 12, "bold"))
-    style.configure("Artist.TLabel", background=bg, foreground=status, font=(config.FONT, 9))
+    style.configure("Track.TLabel", background=card, foreground=fg, font=(config.FONT, 12, "bold"))
+    style.configure("Artist.TLabel", background=card, foreground=status, font=(config.FONT, 9))
     # old names, still used by the dialogs / main window cells
     style.configure("Cell.TFrame", background=card, bordercolor=line)
     style.configure("Status.TLabel", background=card, foreground=status, font=(config.MONO, 9))
