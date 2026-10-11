@@ -9,7 +9,8 @@ read it on this system (or the source stops delivering), Music Mode simply runs 
            writes nowplaying.json + the cover image into config.NOWPLAYING_CACHE_DIR, which is read here.
            Its stdout / stderr go to bridge.log in that folder. If it produces no output within a few
            seconds the reader gives up on it.
-  Linux:   MPRIS over D-Bus via `jeepney` -- title, artist and cover art (file:// or http(s):// URL).
+  Linux:   MPRIS over D-Bus via `jeepney` -- title, artist and cover art (file:// or http(s):// URL) of whichever
+           player is currently playing (any app that speaks MPRIS; no player is hardcoded).
            Best-effort, untested against a real D-Bus session.
   Other:   nothing -- now_playing_available() is False and the window shows no track info.
 
@@ -56,26 +57,41 @@ def now_playing_available() -> bool:
 
 # --------- Linux: MPRIS over D-Bus ---------
 def _fetch_mpris_metadata():
-    """Queries the first available MPRIS player on the session bus for its current Metadata.
-    Returns (title, artist, cover url) or None if no player is registered."""
+    """Asks every MPRIS player on the session bus (whatever app it is -- nothing is hardcoded) and returns
+    (title, artist, cover url, playing) of the one that is actually playing; if none is, the first paused
+    one that has a title. None if there is no player at all."""
     conn = open_dbus_connection(bus="SESSION")
     try:
         bus_addr = DBusAddress("/org/freedesktop/DBus", bus_name="org.freedesktop.DBus",
                                interface="org.freedesktop.DBus")
         names_reply = conn.send_and_get_reply(new_method_call(bus_addr, "ListNames"))
         names = [n for n in names_reply.body[0] if n.startswith("org.mpris.MediaPlayer2.")]
-        if not names:
-            return None
 
-        player_addr = DBusAddress("/org/mpris/MediaPlayer2", bus_name=names[0],
-                                  interface="org.freedesktop.DBus.Properties")
-        get_msg = new_method_call(player_addr, "Get", "ss", ("org.mpris.MediaPlayer2.Player", "Metadata"))
-        metadata = conn.send_and_get_reply(get_msg).body[0][1]      # ("a{sv}", {...}) -> the actual dict
+        def get_property(bus_name, prop):
+            addr = DBusAddress("/org/mpris/MediaPlayer2", bus_name=bus_name,
+                               interface="org.freedesktop.DBus.Properties")
+            msg = new_method_call(addr, "Get", "ss", ("org.mpris.MediaPlayer2.Player", prop))
+            return conn.send_and_get_reply(msg).body[0][1]      # variant ("sig", value) -> the value
 
-        title = metadata.get("xesam:title", ("s", ""))[1]
-        artists = metadata.get("xesam:artist", ("as", []))[1]
-        art_url = metadata.get("mpris:artUrl", ("s", ""))[1]
-        return title, ", ".join(artists) if artists else "", art_url
+        candidates = []                                          # (playing, title, artist, art_url)
+        for name in names:
+            try:
+                status = get_property(name, "PlaybackStatus")
+                metadata = get_property(name, "Metadata")
+            except Exception:                                    # player vanished / doesn't answer
+                continue
+            title = metadata.get("xesam:title", ("s", ""))[1]
+            artists = metadata.get("xesam:artist", ("as", []))[1]
+            art_url = metadata.get("mpris:artUrl", ("s", ""))[1]
+            candidates.append((status == "Playing", title, ", ".join(artists) if artists else "", art_url))
+
+        for playing, title, artist, art_url in candidates:
+            if playing:
+                return title, artist, art_url, True
+        for playing, title, artist, art_url in candidates:
+            if title:
+                return title, artist, art_url, False
+        return None
     finally:
         conn.close()
 
@@ -104,7 +120,7 @@ class NowPlayingReader:
 
     def __init__(self, on_update, poll_interval: float = 1.0, on_playing=None):
         self.on_update = on_update          # callback(title: str, artist: str, cover_bytes: bytes | None)
-        self.on_playing = on_playing        # optional callback(playing: bool), PowerShell bridge only
+        self.on_playing = on_playing        # optional callback(playing: bool)
         self.poll_interval = poll_interval
         self._source = _pick_source()
         self._stop = threading.Event()
@@ -215,7 +231,11 @@ class NowPlayingReader:
         metadata = _fetch_mpris_metadata()
         if metadata is None:
             return
-        title, artist, art_url = metadata
+        title, artist, art_url, playing = metadata
+        if playing != self._last_playing:
+            self._last_playing = playing
+            if self.on_playing:
+                self.on_playing(playing)
         signature = (title, artist, art_url)
         if signature == self._last_signature:
             return
