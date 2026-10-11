@@ -33,7 +33,7 @@ _IS_WINDOWS = sys.platform == "win32"
 # Linux: MPRIS over D-Bus via jeepney (pure Python, no system dev packages needed)
 try:
     if not _IS_WINDOWS:
-        from jeepney import DBusAddress, new_method_call
+        from jeepney import DBusAddress, MessageType, new_method_call
         from jeepney.io.blocking import open_dbus_connection
         _DBUS_AVAILABLE = True
     else:
@@ -71,7 +71,14 @@ def _fetch_mpris_metadata():
             addr = DBusAddress("/org/mpris/MediaPlayer2", bus_name=bus_name,
                                interface="org.freedesktop.DBus.Properties")
             msg = new_method_call(addr, "Get", "ss", ("org.mpris.MediaPlayer2.Player", prop))
-            return conn.send_and_get_reply(msg).body[0][1]      # variant ("sig", value) -> the value
+            reply = conn.send_and_get_reply(msg)
+            if reply.header.message_type == MessageType.error:     # e.g. player without that property
+                raise RuntimeError(f"{bus_name} {prop}: {reply.body}")
+            value = reply.body[0]
+            return value[1] if isinstance(value, tuple) else value  # variant ("sig", value) -> the value
+
+        def unwrap(value):                                          # metadata values are variants too
+            return value[1] if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str) else value
 
         candidates = []                                          # (playing, title, artist, art_url)
         for name in names:
@@ -79,10 +86,16 @@ def _fetch_mpris_metadata():
                 status = get_property(name, "PlaybackStatus")
                 metadata = get_property(name, "Metadata")
             except Exception:                                    # player vanished / doesn't answer
+                logging.debug("MPRIS player %s skipped", name, exc_info=True)
                 continue
-            title = metadata.get("xesam:title", ("s", ""))[1]
-            artists = metadata.get("xesam:artist", ("as", []))[1]
-            art_url = metadata.get("mpris:artUrl", ("s", ""))[1]
+            if not isinstance(metadata, dict):
+                logging.debug("MPRIS player %s: unexpected metadata %r", name, metadata)
+                continue
+            title = unwrap(metadata.get("xesam:title", ""))
+            artists = unwrap(metadata.get("xesam:artist", []))
+            art_url = unwrap(metadata.get("mpris:artUrl", ""))
+            if isinstance(artists, str):
+                artists = [artists]
             candidates.append((status == "Playing", title, ", ".join(artists) if artists else "", art_url))
 
         for playing, title, artist, art_url in candidates:
