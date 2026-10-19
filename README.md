@@ -180,6 +180,9 @@ Each preset is a plain JSON file: `presets/<name>.json`:
 
 DMX512 is a unidirectional protocol: The controller has no way of verifying whether a device is actually receiving data; it can only check whether the USB-DMX adapter itself is accessible via the serial interface. And anyway, I don't think you can use this script for other devices because of the different channels; that might be the biggest limitation :/
 
+## 🙏 Acknowledgments
+Thanks to [Claude](https://claude.ai/) for helping build the UI and for taking on the tedious parts: data formatting, saving, and the many small fixes/debbunging in between.
+
 
 ## 📜 License
 
