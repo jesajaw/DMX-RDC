@@ -81,6 +81,10 @@ class LoopbackSource(AudioSource):
         self._thread = None
         self._callback_error_logged = False
 
+    @property
+    def running(self) -> bool:
+        return self._running
+
     # ---- lifecycle
     def start(self) -> None:
         if self._running:

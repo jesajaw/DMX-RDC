@@ -4,9 +4,10 @@ Music Mode (app / UI)
 
 The Music Mode window. It contains no analysis and no light logic -- it only wires the pieces together:
 
-    audio_source.LoopbackSource  ->  analysis.Analyzer  ->  engine.LightEngine  ->  controller.set_many(values, MUSIC)
-                                                  \\-> this window (visualisation, status)
-    nowplaying.NowPlayingReader  ->  this window (title / artist / spinning cover) + the song key for the analysis cache
+    [analysis process]  audio_source.LoopbackSource -> analysis.Analyzer -> engine.LightEngine -> shared DMX memory
+                                                                      \\-> snapshots (service.py) -> this window
+    [analysis process]  nowplaying.NowPlayingReader -> this window (title / artist / spinning cover)
+                                                    -> the song key for the analysis cache (inside the process)
 
 Left: the round cover in the middle. Around it the waveform as a closed ring (with two fading echoes) and, further
 out, the four frequency bands (Sub / Bass / Mids / Highs) as radial bars (bar length = amplitude, mirrored left /
@@ -22,14 +23,18 @@ DMXController: this window acquire()s it (manual sliders no longer reach the wir
 and release()s it on close, which puts the manual setup back exactly as it was. The engine writes the whole
 9-channel frame every block (channels it never drives, like Ch1, are simply 0).
 
-Threading: audio blocks arrive on the capture thread; analysis, engine and the DMX write run right there
-so the lights never wait for the GUI. The GUI only gets the newest frame (config.UI_FPS times a second at
-most, nothing at all while minimised) and marshals everything else back onto its own thread with self.after.
+Processes: this window is only the GUI. Audio capture, analysis, the light engine and the now-playing reader run in
+their own process (service.py) and write the lights straight into shared memory that the DMX output process sends
+out (dmx_process.py). So the lights never wait for the GUI, and the GUI never waits for audio or maths: it polls
+the service every 1000 / config.UI_FPS ms, takes the newest snapshot (nothing is drawn while minimised) and posts
+settings changes as commands. Nothing here is ever called from another thread.
 """
 
 import io
 import logging
 import math
+import queue
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -40,10 +45,8 @@ from .. import theme
 from ..config import ACTIVE_SCHEME, FONT, MONO
 from ..controller import MUSIC, DMXController, apply_dark_titlebar
 from . import config, engine
-from .analysis import BAND_LABELS, BAND_NAMES, BAND_RANGES, Analyzer, Features
-from .audio_source import LoopbackSource
-from .engine import LightEngine
-from .nowplaying import NowPlayingReader, now_playing_available
+from .analysis import BAND_LABELS, BAND_NAMES, BAND_RANGES
+from .service import AnalysisService, Snapshot
 
 try:
     from PIL import Image, ImageDraw, ImageTk
@@ -202,22 +205,23 @@ class MusicModeWindow(tk.Toplevel):
 
         self.controller = controller
         self.on_closed = on_closed
-        self._latest = None              # newest features, picked up by the GUI
-        self._ui_pending = False
         self._ui_interval_ms = max(1, int(1000 / config.UI_FPS))
         self._last_ui = 0.0
         self._visible = True             # False while minimised: nothing is drawn then
-        self._failed = False
+        self._closing = False
+        self._tick_error_logged = False
 
-        self.analyzer = Analyzer()
         self.look = engine.DEFAULT.copy()
-        self.engine = LightEngine(self.look)
-        self.source = LoopbackSource(on_block=self._on_block, on_error=self._on_source_error)
-        self.now_playing = None
+        # audio capture, analysis, light engine and now-playing live in their own process; this is the handle on it
+        self.service = AnalysisService(controller.shared, self.look, on_error=self._on_service_error,
+                                       on_status=self._on_service_status, on_now_playing=self._apply_now_playing,
+                                       on_playing=self._set_playing)
         self.rows = []                   # RuleRow list
         self._loading = False
         self._status_cache = {}
-        self._hit_flags = {n: False for n in BAND_NAMES}     # set on the audio thread, cleared by the GUI
+        self._cover_ready = queue.Queue()   # cover frames decoded by a helper thread, waiting to become PhotoImages
+        self._cover_gen = 0              # which cover the newest decode job is for
+        self._cover_build = None         # [key, pil_frames, photo_frames] while PhotoImages are being built
         self._glow = {n: 0.0 for n in BAND_NAMES}
         self._last_flat = None
         self._peaks = None
@@ -244,7 +248,8 @@ class MusicModeWindow(tk.Toplevel):
         self.bind("<Unmap>", lambda e: self._set_visible(e, False))
         self.bind("<Map>", lambda e: self._set_visible(e, True))
         self.controller.acquire(MUSIC)
-        self.source.start()
+        self.service.start()
+        self._tick()
 
     def _set_visible(self, event, visible: bool) -> None:
         if event.widget is self:
@@ -415,10 +420,6 @@ class MusicModeWindow(tk.Toplevel):
         canvas.bind("<Enter>", lambda e: self._set_axis_target(1.0))
         canvas.bind("<Leave>", lambda e: self._on_mouse_leave())
         canvas.bind("<Motion>", self._on_mouse_move)
-
-        if now_playing_available():            # otherwise: just no title / cover
-            self.now_playing = NowPlayingReader(on_update=self._on_now_playing, on_playing=self._on_playing)
-            self.now_playing.start()
 
         self._layout_viz()
         self._spin_disc()
@@ -675,7 +676,7 @@ class MusicModeWindow(tk.Toplevel):
     def _on_grid_edit(self) -> None:
         if self._loading:
             return
-        self.engine.rebuild()
+        self.service.rebuild(self.look)
         self._mark_custom()
 
     # --------- Right side: extras (checkboxes)
@@ -684,26 +685,26 @@ class MusicModeWindow(tk.Toplevel):
         box.columnconfigure(0, weight=1)
         self.bouncy_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(box, text="Bouncy Bass", style="Card.TCheckbutton", variable=self.bouncy_var,
-                        command=lambda: setattr(self.engine, "bouncy", bool(self.bouncy_var.get()))
+                        command=lambda: self.service.set_bouncy(self.bouncy_var.get())
                         ).grid(row=0, column=0, sticky="w")
         ttk.Label(box, text=f"Derby motor jumps between position {config.BOUNCE_POS_MIN} and {config.BOUNCE_POS_MAX} "
                             f"on every kick; every 2nd (3rd ...) kick when they come faster than the motor can "
                             f"follow (BOUNCE_TRAVEL_S = {config.BOUNCE_TRAVEL_S} s).",
                   style="Hint.TLabel", wraplength=470, justify="left").grid(row=1, column=0, sticky="w", padx=(22, 0))
-        self.learn_var = tk.BooleanVar(value=self.analyzer.learning)
+        self.learn_var = tk.BooleanVar(value=self.service.state["learning"])
         ttk.Checkbutton(box, text="Learn kick & thresholds per song", style="Card.TCheckbutton",
                         variable=self.learn_var,
-                        command=lambda: setattr(self.analyzer, "learning", bool(self.learn_var.get()))
+                        command=lambda: self.service.set_learning(self.learn_var.get())
                         ).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
     # --------- Right side: sliders
     def _build_tuning(self, parent: ttk.Frame, row: int) -> None:
         box = self._card(parent, "Tuning", row, pady=(0, 0))
         box.columnconfigure(0, weight=1)
-        self._slider(box, 0, "Sensitivity", 0.2, 5.0, self.analyzer.gain, lambda v: f"{v:.1f}\u00d7",
-                     lambda v: setattr(self.analyzer, "gain", v))
-        self._slider(box, 2, "Smoothness", 0.0, 0.95, self.analyzer.smoothing, lambda v: f"{round(v / 0.95 * 100)} %",
-                     lambda v: setattr(self.analyzer, "smoothing", v), pady=(8, 0))
+        self._slider(box, 0, "Sensitivity", 0.2, 5.0, self.service.state["gain"], lambda v: f"{v:.1f}\u00d7",
+                     self.service.set_gain)
+        self._slider(box, 2, "Smoothness", 0.0, 0.95, self.service.state["smoothing"],
+                     lambda v: f"{round(v / 0.95 * 100)} %", self.service.set_smoothing, pady=(8, 0))
 
     def _slider(self, box, row: int, title: str, low: float, high: float, value: float, fmt, apply, pady=(0, 0)) -> None:
         head = ttk.Frame(box, style="Plain.Card.TFrame")
@@ -726,7 +727,7 @@ class MusicModeWindow(tk.Toplevel):
         self._loading = True
         try:
             self.look = preset.copy()
-            self.engine.set_look(self.look)
+            self.service.set_look(self.look)
             self.look_var.set(preset.name)
             self.look_desc.config(text=preset.description)
             self.grid_widget.refresh()
@@ -741,7 +742,7 @@ class MusicModeWindow(tk.Toplevel):
         self.look_desc.config(text="Your own setup. Pick a look above to start over from a ready-made one.")
 
     def _on_blackout(self) -> None:
-        self.engine.force_blackout = bool(self.blackout_var.get())
+        self.service.set_blackout(self.blackout_var.get())
 
     # --------- Footer: the audio device as a small symbol
     def _build_device_icon(self, parent: ttk.Frame) -> None:
@@ -787,75 +788,60 @@ class MusicModeWindow(tk.Toplevel):
     # --------- Tempo re-check
     def _recheck_tempo(self) -> None:
         """Forget tempo and bar count and listen again (the bar counter restarts with the new lock)."""
-        self.analyzer.request_tempo_recheck()
+        self.service.recheck_tempo()
         self._set_text(self.lock_label, "lock", "re-checking tempo...")
         self._set_text(self.bar_label, "bar", "")
         self._status_cache["beat"] = None
 
-    # --------- Audio blocks
-    # The lights are computed and written to the DMX buffer right here on the capture thread: no Tk event queue,
-    # no drawing in between. The GUI only gets the newest frame, at most ~45 times a second.
-    def _on_source_error(self, error: Exception) -> None:
-        self._call_gui(self._show_error, error)
-
-    def _on_block(self, samples: np.ndarray, samplerate: int) -> None:
-        try:
-            features = self.analyzer.process(samples, samplerate)
-            values = self.engine.process(features)         # channels 1..9, channel 1 is always 0
-        except Exception as e:
-            if not self._failed:                            # log once, never spam from the audio thread
-                self._failed = True
-                logging.exception("Music Mode processing failed")
-                self._call_gui(self.status_label.config, text=f"Light engine error: {e}")
+    # --------- Polling the analysis process
+    # The lights do not depend on any of this: the analysis process writes them straight into the DMX shared memory.
+    # This loop only picks up the newest snapshot for drawing, and delivers events (title, cover, errors).
+    def _tick(self) -> None:
+        if self._closing:
             return
-        self.controller.set_many(values, MUSIC)
-        for name in BAND_NAMES:
-            if features.hit[name]:
-                self._hit_flags[name] = True
-        self._latest = features
-        if not self._ui_pending:
-            self._ui_pending = True
-            wait = self._ui_interval_ms - (time.monotonic() - self._last_ui) * 1000
-            self._call_gui(self._ui_update, delay=max(0, int(wait)))
-
-    def _call_gui(self, fn, *args, delay: int = 0, **kwargs) -> None:
+        self.after(self._ui_interval_ms, self._tick)          # first: whatever happens below, the loop goes on
         try:
-            self.after(delay, lambda: fn(*args, **kwargs))
-        except (tk.TclError, RuntimeError):              # window is closing
-            pass
+            snapshot = self.service.poll()
+            self._poll_cover()
+            if snapshot is not None and self._visible:
+                self._ui_update(snapshot)
+        except Exception:
+            if not self._tick_error_logged:                    # log once, never spam, never stop updating
+                self._tick_error_logged = True
+                logging.exception("Music Mode GUI update failed")
 
-    def _show_error(self, error: Exception) -> None:
-        logging.error("Music Mode audio error", exc_info=error)
-        self.status_label.config(text=f"Audio error: {error}")
+    def _on_service_error(self, text: str) -> None:
+        logging.error("Music Mode: %s", text)
+        self.status_label.config(text=text)
 
-    def _ui_update(self) -> None:
-        self._ui_pending = False
+    def _on_service_status(self, text: str) -> None:
+        logging.warning("Music Mode: %s", text)
+        self.status_label.config(text=text)
+
+    def _ui_update(self, snap: Snapshot) -> None:
         now = time.monotonic()
         dt, self._last_ui = now - self._last_ui, now
-        features = self._latest
-        if features is None or not self._visible:
-            return
+        features = snap.features
         step = min(dt, 0.25) / config.UI_REF_DT          # decays are tuned per UI_REF_DT -> same look at any FPS
 
-        flags, self._hit_flags = self._hit_flags, {n: False for n in BAND_NAMES}
         decay = config.HIT_GLOW_DECAY ** step
         for name in BAND_NAMES:
-            self._glow[name] = 1.0 if flags[name] else (self._glow[name] * decay if self._glow[name] > 0.02 else 0.0)
+            self._glow[name] = 1.0 if snap.hits[name] else (self._glow[name] * decay if self._glow[name] > 0.02 else 0.0)
         self._pulse = max(self._glow["bass"], self._glow["sub"]) * 6.0
 
         self._update_bars(features.bars, config.SPECTRUM_PEAK_DECAY * step)
         self._update_arcs()
         self._update_waveform(features.waveform)
         self._update_axes()
-        self._update_status(features)
+        self._update_status(snap)
 
     def _set_text(self, widget, key: str, text: str) -> None:
         if self._status_cache.get(key) != text:      # only touch Tk when something actually changed
             self._status_cache[key] = text
             widget.config(text=text)
 
-    def _update_status(self, f: Features) -> None:
-        eng = self.engine
+    def _update_status(self, snap: Snapshot) -> None:
+        f = snap.features
         if not f.active:
             self._set_text(self.bpm_label, "bpm", "-- BPM")
             self._set_text(self.lock_label, "lock", "no music")
@@ -865,8 +851,8 @@ class MusicModeWindow(tk.Toplevel):
             if f.kick_hz:
                 state += f"  \u00b7  kick \u2248 {f.kick_hz:.0f} Hz" + ("" if f.kick_learned else " (learning)")
             self._set_text(self.lock_label, "lock", state)
-        if self.source.device_name != self._device_name:
-            self._device_name = self.source.device_name
+        if snap.device != self._device_name:
+            self._device_name = snap.device
             self._draw_device_icon(self._device_name)
         connected = self.controller.connected         # is anything going to reach the fixture at all?
         self._set_text(self.dmx_label, "dmx", "\u25cf DMX connected" if connected else
@@ -899,7 +885,7 @@ class MusicModeWindow(tk.Toplevel):
                                              outline=self._band_colour[name] if lit else self.colors["LINE"])
 
         # little fixture preview: what the lights are doing right now
-        pv = eng.preview()
+        pv = snap.preview
         state = (pv["led"], pv["derby"], pv["derby_position"], pv["laser"], pv["laser_rotation"], pv["blackout"])
         if state != self._preview_state:
             self._preview_state = state
@@ -988,55 +974,81 @@ class MusicModeWindow(tk.Toplevel):
             pts[-2], pts[-1] = xs[0], ys[0]                              # close the ring
             canvas.coords(item, *pts.tolist())
 
-    # --------- Now Playing
-    def _on_playing(self, playing: bool) -> None:
-        self.after(0, self._set_playing, playing)
-
+    # --------- Now Playing (events from the analysis process; they arrive in poll(), on this thread)
     def _set_playing(self, playing: bool) -> None:
         self._playing = playing
-
-    def _on_now_playing(self, title: str, artist: str, cover_bytes) -> None:
-        self.after(0, self._apply_now_playing, title, artist, cover_bytes)
 
     def _apply_now_playing(self, title: str, artist: str, cover_bytes) -> None:
         self.track_label.config(text=title or "")
         self.artist_label.config(text=artist or "")
-        key = " - ".join(part.strip() for part in (artist, title) if part and part.strip())
-        if key != self._song_key:                        # a different track: the analysis switches to its cached values
-            self._song_key = key
-            self.analyzer.request_song(key or None)
+        # (the analysis process already switched to this track's cached values, it reads the same title / artist)
 
         if not _PIL_AVAILABLE:
             logging.warning("Pillow is not installed -- no cover art (pip install pillow)")
 
         if not (_PIL_AVAILABLE and cover_bytes):
+            self._cover_gen += 1                          # a decode that is still running is obsolete
+            self._cover_build = None
             self._clear_cover()
             return
 
         key = hash(cover_bytes)
         if key == self._cover_key and self._cover_frames:
             return  # same cover already on the disc
+        self._cover_gen += 1
+        threading.Thread(target=self._decode_cover, args=(cover_bytes, key, self._cover_gen, config.COVER_SIZE,
+                                                          config.SPIN_STEP_DEG),
+                         name="cover-decode", daemon=True).start()
+
+    def _decode_cover(self, cover_bytes, key, gen: int, cover_size: int, step: int) -> None:
+        """Helper thread: all the PIL work (decode, resize, round mask, every rotation). It touches no Tk object, so
+        the GUI never stalls on a big cover. Only the cheap PhotoImage step is left for the main thread."""
         try:
-            cover_size = config.COVER_SIZE
             img = Image.open(io.BytesIO(cover_bytes)).convert("RGBA")
             img = img.resize((cover_size, cover_size), Image.LANCZOS)
             mask = Image.new("L", (cover_size, cover_size), 0)
             ImageDraw.Draw(mask).ellipse((0, 0, cover_size, cover_size), fill=255)
             img.putalpha(mask)
-
-            # Build every rotation ONCE, here on the Tk main thread. Creating/freeing a
-            # PhotoImage on every animation tick (and letting the garbage collector
-            # free them from whatever thread it happens to run on) can hang Tk.
             # PIL rotates counter-clockwise, so negate to spin clockwise
-            step = config.SPIN_STEP_DEG
-            frames = [ImageTk.PhotoImage(img.rotate(-a, resample=Image.BICUBIC))
-                      for a in range(0, 360, step)]
-            self._cover_frames = frames
-            self._cover_key = key
-            self._cover_frame_idx = -1
+            frames = [img.rotate(-a, resample=Image.BICUBIC) for a in range(0, 360, step)]
         except Exception:
             logging.exception("Failed to process cover art")
+            frames = None
+        self._cover_ready.put((gen, key, frames))
+
+    def _poll_cover(self) -> None:
+        """GUI thread, every tick: picks up a decoded cover and turns its frames into PhotoImages a few at a time
+        (creating / freeing PhotoImages must happen on the Tk thread, but 60 at once would be a visible stall)."""
+        while True:
+            try:
+                gen, key, frames = self._cover_ready.get_nowait()
+            except queue.Empty:
+                break
+            if gen != self._cover_gen:
+                continue                                   # a newer track arrived while this one was decoding
+            if frames is None:
+                self._clear_cover()
+            else:
+                self._cover_build = [key, frames, []]
+        build = self._cover_build
+        if build is None:
+            return
+        key, frames, photos = build
+        try:
+            for _ in range(config.COVER_FRAMES_PER_TICK):
+                if len(photos) == len(frames):
+                    break
+                photos.append(ImageTk.PhotoImage(frames[len(photos)]))
+        except Exception:
+            logging.exception("Failed to build cover frames")
+            self._cover_build = None
             self._clear_cover()
+            return
+        if len(photos) == len(frames):                     # complete: swap the whole set in at once
+            self._cover_build = None
+            self._cover_frames = photos
+            self._cover_key = key
+            self._cover_frame_idx = -1
 
     def _clear_cover(self) -> None:
         self._cover_frames = []
@@ -1046,11 +1058,11 @@ class MusicModeWindow(tk.Toplevel):
 
     # --------- Closing
     def _on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         self._hide_device_tip()
-        self.source.stop()
-        self.analyzer.flush()                        # learned kick frequencies etc. go to song_profiles.json
-        if self.now_playing:
-            self.now_playing.stop()
-        self.controller.release(MUSIC)               # the manual setup goes back on the wire
+        self.controller.release(MUSIC)               # the manual setup goes back on the wire first, at once
+        self.service.stop()                          # the process saves its learned values and exits on its own
         self.on_closed()
         self.destroy()

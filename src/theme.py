@@ -1,5 +1,6 @@
-from tkinter import ttk
+# written by AI!
 
+from tkinter import ttk
 from . import config
 
 def _luminance(hex_colour: str) -> float:
@@ -9,13 +10,11 @@ def _luminance(hex_colour: str) -> float:
 
 
 def on_accent(colours: dict | None = None) -> str:
-    """Text colour that stays readable on the accent colour."""
     colours = colours or config.ACTIVE_SCHEME
     return "#1e1e24" if _luminance(colours["ACCENT"]) > 0.6 else "#ffffff"
 
 
 def lerp_colour(a: str, b: str, t: float) -> str:
-    """Linear blend between two #rrggbb colours (t = 0 -> a, t = 1 -> b)."""
     a, b = a.lstrip("#"), b.lstrip("#")
     out = []
     for i in (0, 2, 4):
@@ -33,10 +32,8 @@ def apply_theme(widget) -> None:
 
     style = ttk.Style(widget)
     style.theme_use("clam")
-    style.configure(".", background=bg, foreground=fg, font=(config.FONT, 9), bordercolor=line,
-                    lightcolor=bg, darkcolor=bg, focuscolor=bg, troughcolor=bg)
+    style.configure(".", background=bg, foreground=fg, font=(config.FONT, 9), bordercolor=line, lightcolor=bg, darkcolor=bg, focuscolor=bg, troughcolor=bg)
 
-    # --- frames / labels
     style.configure("TFrame", background=bg)
     style.configure("Card.TFrame", background=card, bordercolor=line, relief="solid", borderwidth=1)
     style.configure("Plain.Card.TFrame", background=card, borderwidth=0, relief="flat")
@@ -54,7 +51,6 @@ def apply_theme(widget) -> None:
     style.configure("Value.TLabel", background=card, foreground=status, font=(config.MONO, 9))
     style.configure("Track.TLabel", background=card, foreground=fg, font=(config.FONT, 12, "bold"))
     style.configure("Artist.TLabel", background=card, foreground=status, font=(config.FONT, 9))
-    # old names, still used by the dialogs / main window cells
     style.configure("Cell.TFrame", background=card, bordercolor=line)
     style.configure("Status.TLabel", background=card, foreground=status, font=(config.MONO, 9))
     style.configure("CellTitle.TLabel", background=card, foreground=fg, font=(config.FONT, 9, "bold"))
@@ -62,48 +58,24 @@ def apply_theme(widget) -> None:
     style.configure("TLabelframe.Label", background=bg, foreground=accent)
     style.configure("TSeparator", background=line)
 
-    # --- buttons
-    style.configure("TButton", background=card, foreground=fg, bordercolor=line, focusthickness=0,
-                    padding=(14, 7), relief="flat")
-    style.map("TButton", background=[("active", accent_dark), ("pressed", accent)],
-              foreground=[("active", fg)], bordercolor=[("active", accent)])
-    style.configure("Accent.TButton", background=accent, foreground=ink, bordercolor=accent, padding=(16, 7),
-                    font=(config.FONT, 9, "bold"))
-    style.map("Accent.TButton", background=[("active", accent2), ("pressed", accent_dark)],
-              foreground=[("active", on_accent({"ACCENT": accent2}))])
-    style.configure("Blackout.TButton", background=accent_dark, foreground=fg, bordercolor=accent_dark,
-                    padding=(16, 7), font=(config.FONT, 9, "bold"))
-    style.map("Blackout.TButton", background=[("active", accent), ("pressed", accent2), ("selected", accent)],
-              foreground=[("active", ink)])
+    style.configure("TButton", background=card, foreground=fg, bordercolor=line, focusthickness=0, padding=(14, 7), relief="flat")
+    style.map("TButton", background=[("active", accent_dark), ("pressed", accent)], foreground=[("active", fg)], bordercolor=[("active", accent)])
+    style.configure("Accent.TButton", background=accent, foreground=ink, bordercolor=accent, padding=(16, 7), font=(config.FONT, 9, "bold"))
+    style.map("Accent.TButton", background=[("active", accent2), ("pressed", accent_dark)], foreground=[("active", on_accent({"ACCENT": accent2}))])
+    style.configure("Blackout.TButton", background=accent_dark, foreground=fg, bordercolor=accent_dark, padding=(16, 7), font=(config.FONT, 9, "bold"))
+    style.map("Blackout.TButton", background=[("active", accent), ("pressed", accent2), ("selected", accent)], foreground=[("active", ink)])
+    style.configure("Chip.Toolbutton", background=bg, foreground=muted, bordercolor=line, relief="flat", padding=(11, 5), font=(config.FONT, 9, "bold"), focuscolor=bg)
+    style.map("Chip.Toolbutton", background=[("selected", accent), ("active", accent_dark)], foreground=[("selected", ink), ("active", fg)], bordercolor=[("selected", accent), ("active", accent)])
+    style.configure("Look.Toolbutton", background=card, foreground=fg, bordercolor=line, relief="flat", padding=(10, 6), font=(config.FONT, 9, "bold"), focuscolor=card)
+    style.map("Look.Toolbutton", background=[("selected", accent), ("active", accent_dark)], foreground=[("selected", ink), ("active", fg)], bordercolor=[("selected", accent), ("active", accent)])
 
-    # --- pill toggles (Checkbutton / Radiobutton with style="Chip.Toolbutton")
-    style.configure("Chip.Toolbutton", background=bg, foreground=muted, bordercolor=line, relief="flat",
-                    padding=(11, 5), font=(config.FONT, 9, "bold"), focuscolor=bg)
-    style.map("Chip.Toolbutton",
-              background=[("selected", accent), ("active", accent_dark)],
-              foreground=[("selected", ink), ("active", fg)],
-              bordercolor=[("selected", accent), ("active", accent)])
-    style.configure("Look.Toolbutton", background=card, foreground=fg, bordercolor=line, relief="flat",
-                    padding=(10, 6), font=(config.FONT, 9, "bold"), focuscolor=card)
-    style.map("Look.Toolbutton",
-              background=[("selected", accent), ("active", accent_dark)],
-              foreground=[("selected", ink), ("active", fg)],
-              bordercolor=[("selected", accent), ("active", accent)])
+    style.configure("TCheckbutton", background=bg, foreground=fg, focuscolor=bg, indicatorbackground=bg, indicatorforeground=accent2)
+    style.map("TCheckbutton", background=[("active", bg)], indicatorbackground=[("selected", accent)], foreground=[("disabled", muted)])
+    style.configure("Card.TCheckbutton", background=card, foreground=fg, focuscolor=card, indicatorbackground=bg, indicatorforeground=ink)
+    style.map("Card.TCheckbutton", background=[("active", card)], indicatorbackground=[("selected", accent)], foreground=[("disabled", muted)])
 
-    style.configure("TCheckbutton", background=bg, foreground=fg, focuscolor=bg,
-                    indicatorbackground=bg, indicatorforeground=accent2)
-    style.map("TCheckbutton", background=[("active", bg)], indicatorbackground=[("selected", accent)],
-              foreground=[("disabled", muted)])
-    style.configure("Card.TCheckbutton", background=card, foreground=fg, focuscolor=card,
-                    indicatorbackground=bg, indicatorforeground=ink)
-    style.map("Card.TCheckbutton", background=[("active", card)], indicatorbackground=[("selected", accent)],
-              foreground=[("disabled", muted)])
-
-    # --- inputs
-    style.configure("TCombobox", fieldbackground=bg, background=card, foreground=fg, arrowcolor=accent2,
-                    bordercolor=line, padding=4)
-    style.map("TCombobox", fieldbackground=[("readonly", bg)], foreground=[("readonly", fg)],
-              bordercolor=[("focus", accent)])
+    style.configure("TCombobox", fieldbackground=bg, background=card, foreground=fg, arrowcolor=accent2, bordercolor=line, padding=4)
+    style.map("TCombobox", fieldbackground=[("readonly", bg)], foreground=[("readonly", fg)], bordercolor=[("focus", accent)])
     style.configure("TEntry", fieldbackground=bg, foreground=fg, insertcolor=fg, bordercolor=line)
     widget.option_add("*TCombobox*Listbox.background", bg)
     widget.option_add("*TCombobox*Listbox.foreground", fg)
@@ -111,16 +83,9 @@ def apply_theme(widget) -> None:
     widget.option_add("*TCombobox*Listbox.selectForeground", fg)
     widget.option_add("*TCombobox*Listbox.font", (config.FONT, 9))
 
-    # --- sliders: handle in the accent colour, dark groove
     for name, trough in (("Horizontal.TScale", card), ("Card.Horizontal.TScale", bg)):
-        style.configure(name, background=accent, troughcolor=trough, bordercolor=line, lightcolor=accent,
-                        darkcolor=accent, sliderthickness=14, sliderrelief="flat")
-        style.map(name, background=[("active", accent2), ("disabled", line)],
-                  lightcolor=[("active", accent2), ("disabled", line)],
-                  darkcolor=[("active", accent2), ("disabled", line)])
+        style.configure(name, background=accent, troughcolor=trough, bordercolor=line, lightcolor=accent, darkcolor=accent, sliderthickness=14, sliderrelief="flat")
+        style.map(name, background=[("active", accent2), ("disabled", line)], lightcolor=[("active", accent2), ("disabled", line)], darkcolor=[("active", accent2), ("disabled", line)])
 
-    # --- progress bars
-    style.configure("Meter.Horizontal.TProgressbar", troughcolor=bg, background=accent, bordercolor=bg,
-                    lightcolor=accent, darkcolor=accent, thickness=8)
-    style.configure("Build.Horizontal.TProgressbar", troughcolor=bg, background=accent2, bordercolor=bg,
-                    lightcolor=accent2, darkcolor=accent2, thickness=6)
+    style.configure("Meter.Horizontal.TProgressbar", troughcolor=bg, background=accent, bordercolor=bg, lightcolor=accent, darkcolor=accent, thickness=8)
+    style.configure("Build.Horizontal.TProgressbar", troughcolor=bg, background=accent2, bordercolor=bg, lightcolor=accent2, darkcolor=accent2, thickness=6)

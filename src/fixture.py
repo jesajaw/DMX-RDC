@@ -1,19 +1,3 @@
-"""
-The ONE place that knows the Varytec Razor Derby in its 9-channel mode (see the manual in the project root).
-The manual window, Music Mode and the controller all take their channel names, device groups, colour ranges and value texts from here -- nothing about the channel layout is defined anywhere else.
-
-    Derby   Ch3 colour, Ch4 strobe, Ch5 motor
-    LED     Ch6 pattern
-    Laser   Ch7 colour, Ch8 strobe, Ch9 rotation
-    Auto    Ch1 show select, Ch2 speed
-
-Three parts:
-    1. the channel table                    (names, which device a channel belongs to, describe(channel, value))
-    2. colour / pattern / position tables   (one range per entry; the DMX value sent is the middle of it)
-    3. the device states                    (Led, Derby, Laser, Fixture) that render themselves to {channel: value}; this is what Music Mode's engine drives
-
-"""
-
 from dataclasses import dataclass, field
 
 CHANNEL_COUNT = 9
@@ -27,12 +11,6 @@ CH_LASER_COLOUR, CH_LASER_STROBE, CH_LASER_ROTATION = 7, 8, 9
 
 def _clamp(x: int, low: int, high: int) -> int:
     return low if x < low else high if x > high else x
-
-
-# =====================================================================================
-# 1. Channels and devices
-# number -> short name
-# =====================================================================================
 
 CHANNEL_NAMES = {
     1: "Show Select", 2: "Speed",
@@ -61,9 +39,6 @@ def channel_title(channel: int) -> str:
     return f"{channel} \u00b7 {CHANNEL_NAMES[channel]}"
 
 
-# =====================================================================================
-# 2. Value tables
-# =====================================================================================
 @dataclass(frozen=True)
 class Colour:
     key: str
@@ -124,17 +99,11 @@ LASER_CW_VALUE = 66              # clockwise, range 5..127
 LASER_CCW_VALUE = 194            # counter-clockwise, range 134..255
 LASER_ROTATION = {"stop": 0, "cw": LASER_CW_VALUE, "ccw": LASER_CCW_VALUE}
 
-
-# =====================================================================================
-# describe(): channel value -> readable text
-# =====================================================================================
 def _steps(*pairs):
     return tuple(pairs)
 
 
-_SHOW = _steps((9, "Manual (Blackout/Ch.3 active)"), (44, "Derby + Laser + Strobe"), (79, "Derby + Strobe"),
-               (114, "Derby + Laser"), (149, "Laser + Strobe"), (184, "Derby Effect"), (219, "Laser Effect"),
-               (255, "Strobe Effect"))
+_SHOW = _steps((9, "Manual (Blackout/Ch.3 active)"), (44, "Derby + Laser + Strobe"), (79, "Derby + Strobe"), (114, "Derby + Laser"), (149, "Laser + Strobe"), (184, "Derby Effect"), (219, "Laser Effect"), (255, "Strobe Effect"))
 _DERBY_COLOUR = _steps((5, "Off"), *((c.high, c.label) for c in DERBY_COLOURS.values()))
 _LASER_MODE = _steps((9, "Laser Off"), *((c.high, c.label) for c in LASER_COLOURS.values()), *_LASER_STROBE_STEPS)
 
@@ -148,11 +117,9 @@ def _pick(table, value: int) -> str:
 
 def _speed(v):    return f"Speed: {int(v / 250 * 100)}%" if v <= 250 else "Sound Control"
 def _strobe(v):   return "Strobe Off" if v <= 5 else f"Derby Strobe Rate: {int(v / 255 * 100)}%"
-def _motor(v):    return ("Motor Stopped" if v == 0 else f"Manual Position: {v}" if v <= 127
-                          else f"Rotation Speed: {int((v - 128) / 127 * 100)}%")
+def _motor(v):    return ("Motor Stopped" if v == 0 else f"Manual Position: {v}" if v <= 127 else f"Rotation Speed: {int((v - 128) / 127 * 100)}%")
 def _pattern(v):  return "Blackout" if v <= 9 else f"Pattern {pattern_of(v)}"
-def _lstrobe(v):  return ("Laser Strobe Off" if v <= 9 else f"Laser Strobe Rate: {int(v / 254 * 100)}%" if v <= 254
-                          else "Sound-Controlled Strobe")
+def _lstrobe(v):  return ("Laser Strobe Off" if v <= 9 else f"Laser Strobe Rate: {int(v / 254 * 100)}%" if v <= 254 else "Sound-Controlled Strobe")
 def _rotation(v): return "Stopped" if v <= 4 or 127 < v <= 133 else "Rotation CW" if v <= 127 else "Rotation CCW"
 
 
@@ -169,14 +136,10 @@ def describe(channel: int, value) -> str:
     fn = _DESCRIBE.get(channel)
     return f"{v} | {fn(v)}" if fn else str(v)
 
-
-# =====================================================================================
-# 3. Device states
-# =====================================================================================
 @dataclass
 class Led:
     on: bool = False
-    pattern: int = 1 # 1..PATTERN_COUNT; kept while the LED is off
+    pattern: int = 1
 
     def set(self, attr: str, value) -> None:
         if attr == "on":
@@ -192,9 +155,9 @@ class Led:
 
 @dataclass
 class Derby:
-    on: bool = False                     # off = colour channel 0; the motor is independent of it
+    on: bool = False
     colour: str = "red"
-    position: int = POSITION_NEUTRAL     # 0 = neutral, else POSITION_MIN..POSITION_MAX
+    position: int = POSITION_NEUTRAL
 
     def set(self, attr: str, value) -> None:
         if attr == "on":
@@ -210,15 +173,14 @@ class Derby:
             raise KeyError(attr)
 
     def dmx(self) -> dict:
-        return {CH_DERBY_COLOUR: DERBY_COLOURS[self.colour].dmx if self.on else 0,
-                CH_DERBY_MOTOR: self.position}
+        return {CH_DERBY_COLOUR: DERBY_COLOURS[self.colour].dmx if self.on else 0, CH_DERBY_MOTOR: self.position}
 
 
 @dataclass
 class Laser:
     on: bool = False
     colour: str = "green"
-    rotation: str = "stop"               # stop | cw | ccw
+    rotation: str = "stop"
 
     def set(self, attr: str, value) -> None:
         if attr == "on":
@@ -235,13 +197,11 @@ class Laser:
             raise KeyError(attr)
 
     def dmx(self) -> dict:
-        return {CH_LASER_COLOUR: LASER_COLOURS[self.colour].dmx if self.on else 0,
-                CH_LASER_ROTATION: LASER_ROTATION[self.rotation] if self.on else 0}
+        return {CH_LASER_COLOUR: LASER_COLOURS[self.colour].dmx if self.on else 0, CH_LASER_ROTATION: LASER_ROTATION[self.rotation] if self.on else 0}
 
 
 @dataclass
 class Fixture:
-    # all three devices. set("derby.colour", "blue") / get(...) address one property, dmx() is the whole frame
     led: Led = field(default_factory=Led)
     derby: Derby = field(default_factory=Derby)
     laser: Laser = field(default_factory=Laser)
@@ -255,7 +215,7 @@ class Fixture:
         return getattr(getattr(self, device), attr)
 
     def dmx(self) -> dict:
-        frame = {ch: 0 for ch in CHANNELS} # channels nobody drives (Ch1, 2, 4, 8) stay 0
+        frame = {ch: 0 for ch in CHANNELS}
         for device in (self.led, self.derby, self.laser):
             frame.update(device.dmx())
         return frame

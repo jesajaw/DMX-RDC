@@ -168,6 +168,7 @@ PIXEL_DOT_COUNT = 8             # rotating dots shown while there is no cover
 PIXEL_DOT_RADIUS = 30
 PIXEL_DOT_SIZE = 8
 SPIN_STEP_DEG = 6
+COVER_FRAMES_PER_TICK = 8        # PhotoImages built per GUI tick when a new cover arrives (keeps the GUI smooth)
 SPIN_INTERVAL_MS = 80
 WAVE_DISPLAY_GAIN = 2.5          # waveform ring: how far a full-scale sample pushes the ring
 WAVE_RING_OFFSET = 20            # waveform ring: px between the disc edge and the ring's centre line

@@ -1,37 +1,15 @@
-"""
-DMX Controller & Presets
-=========================
-
-Non-UI layer: DMXController is the single interface to the lights (serial DMX512 link to a USB-DMX
-adapter + send thread; the manual window and Music Mode both write through it), PresetManager keeps
-saved channel presets on disk.
-
-Also contains a few small Windows-only display helpers (DPI awareness, dark
-title bar). They live here rather than in app.py so musicmode/music_app.py can
-import them too without creating a circular import with app.py (app.py imports
-MusicModeWindow from music_app.py). All of them are no-ops on non-Windows.
-"""
-
-import ctypes
+# partial implementation by ai
+import ctypes, json, logging, multiprocessing, queue, sys, time
 import ctypes.wintypes as wintypes
-import json
-import sys
-import threading
-import time
 from pathlib import Path
 
-import serial
-
-from . import config, fixture
+from . import fixture
+from .dmx_process import MANUAL, MODE_MANUAL, MODE_MUSIC, MUSIC, SharedDMX, dmx_main
 
 
 def _is_windows() -> bool:
     return sys.platform == "win32"
 
-
-# Only touch ctypes.windll on Windows -- it doesn't exist on other platforms,
-# so referencing it unconditionally at import time would crash the whole
-# package on Linux/macOS before any platform check even runs.
 if _is_windows():
     _user32 = ctypes.windll.user32
     _dwmapi = ctypes.windll.dwmapi
@@ -40,151 +18,204 @@ if _is_windows():
     _user32.GetParent.restype = wintypes.HWND
 
     _dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
-    _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
+    _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
 else:
     _user32 = None
     _dwmapi = None
 
 
-MANUAL, MUSIC = "manual", "music"
-
-
 class DMXController:
-    """The one interface to the lights. The manual window and Music Mode both write through it.
+    HANG_S = 3.0
+    CONNECT_TIMEOUT_S = 15.0
+    MAX_RESTARTS = 3
+    RESTART_WINDOW_S = 60.0
 
-    - set(channel, value, source) / set_many(values, source): the buffer that goes out on the wire.
-    - Every manual change is also remembered as the *manual state*. While another source (Music Mode) has
-      acquire()d the lights, manual writes only update that remembered state; release() puts it back on the
-      wire. So opening Music Mode and closing it again leaves the manual setup exactly as it was.
-    - connect() / disconnect() own the serial port and the send thread (a frame is sent over and over, as DMX needs).
-    Writes are plain item assignments on a bytearray, so they are safe from any thread (the audio thread writes
-    from the capture callback, the GUI from the Tk thread).
-    """
+    def __init__(self, on_lost=None, on_connected=None, on_connect_failed=None):
+        self.on_lost = on_lost
+        self.on_connected = on_connected
+        self.on_connect_failed = on_connect_failed
+        self._ctx = multiprocessing.get_context("spawn")
+        self.shared = SharedDMX(self._ctx)
+        self._owner: str | None = None
+        self._proc = None
+        self._cmd_q = None
+        self._evt_q = None
+        self._port: str | None = None
+        self._connecting_since: float | None = None
+        self._beat = 0
+        self._beat_t = time.monotonic()
+        self._restarts: list[float] = []
+        self._start_process()
 
-    def __init__(self, on_lost=None):
-        self.on_lost = on_lost # callback(error), called from the send thread
-        self._live = bytearray(config.UNIVERSE_SIZE)
-        self._manual = bytearray(config.UNIVERSE_SIZE)
-        self._owner: str | None = None # None = manual, else the source that acquired the lights
-        self._serial = None
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
+    def _start_process(self) -> None:
+        self._cmd_q = self._ctx.Queue()
+        self._evt_q = self._ctx.Queue()
+        self._cmd_q.cancel_join_thread()
+        self._proc = self._ctx.Process(target=dmx_main, args=(self.shared, self._cmd_q, self._evt_q), name="dmx-output", daemon=True)
+        self._proc.start()
+        self.shared.connected.value = 0
+        self._beat = self.shared.dmx_beat.value
+        self._beat_t = time.monotonic()
 
-    # ---- writing
-    def set(self, channel: int, value: int, source: str = MANUAL) -> None:
-        if not 1 <= channel < config.UNIVERSE_SIZE:
+    def _kill_process(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                if proc.is_alive():
+                    proc.kill()
+                proc.join(timeout=1.0)
+            except Exception:
+                logging.debug("could not stop the DMX process", exc_info=True)
+        for q in (self._cmd_q, self._evt_q):
+            try:
+                q.close()
+                q.cancel_join_thread()
+            except Exception:
+                pass
+
+    def _restart(self, reason: str) -> None:
+        port, was_connected = self._port, self.connected or self._connecting_since is not None
+        logging.error("DMX output process restarted: %s", reason)
+        self._kill_process()
+        now = time.monotonic()
+        self._restarts = [t for t in self._restarts if now - t < self.RESTART_WINDOW_S] + [now]
+        self._connecting_since = None
+        self._start_process()
+        if not was_connected or port is None:
             return
-        value = 0 if value < 0 else 255 if value > 255 else int(value)
+        if len(self._restarts) > self.MAX_RESTARTS:
+            self._port = None
+            if self.on_lost:
+                self.on_lost(f"The DMX output keeps failing ({reason})")
+            return
+        self._connecting_since = now
+        self._cmd_q.put(("connect", port))
+
+    def poll(self) -> None:
+        if self._proc is None:
+            return
+        while True:
+            try:
+                event = self._evt_q.get_nowait()
+            except (queue.Empty, EOFError, OSError):
+                break
+            self._handle(event)
+            if self._proc is None:
+                return
+
+        now = time.monotonic()
+        if not self._proc.is_alive():
+            self._restart(f"process exited with code {self._proc.exitcode}")
+            return
+        if self._connecting_since is not None:
+            if now - self._connecting_since > self.CONNECT_TIMEOUT_S:
+                port, self._port, self._connecting_since = self._port, None, None
+                self._kill_process()
+                self._start_process()
+                if self.on_connect_failed:
+                    self.on_connect_failed(port or "", "Opening the port timed out")
+            return
+        if self.connected:
+            beat = self.shared.dmx_beat.value
+            if beat != self._beat:
+                self._beat, self._beat_t = beat, now
+            elif now - self._beat_t > self.HANG_S:
+                self._restart("no frame was sent for %.0f s" % self.HANG_S)
+
+    def _handle(self, event) -> None:
+        kind = event[0]
+        if kind == "connected":
+            self._connecting_since = None
+            self._beat, self._beat_t = self.shared.dmx_beat.value, time.monotonic()
+            if self.on_connected:
+                self.on_connected(event[1])
+        elif kind == "connect_failed":
+            self._connecting_since, self._port = None, None
+            if self.on_connect_failed:
+                self.on_connect_failed(event[1], event[2])
+        elif kind == "lost":
+            self._port = None
+            if self.on_lost:
+                self.on_lost(event[1])
+        elif kind == "disconnected":
+            self._port = None
+
+    def set(self, channel: int, value: int, source: str = MANUAL) -> None:
         if source == MANUAL:
-            self._manual[channel] = value
-            if self._owner is None:
-                self._live[channel] = value
+            self.shared.write_manual(channel, value)
         elif source == self._owner:
-            self._live[channel] = value
+            self.shared.write_music({channel: value})
 
     def set_many(self, values: dict, source: str = MANUAL) -> None:
         for channel, value in values.items():
             self.set(channel, value, source)
 
     def get(self, channel: int) -> int:
-        """What is on the wire for this channel right now."""
-        return self._live[channel]
+        return self.shared.live(channel)
 
     def manual_values(self) -> dict:
-        return {ch: self._manual[ch] for ch in fixture.CHANNELS}
+        return {ch: self.shared.manual[ch] for ch in fixture.CHANNELS}
 
     def blackout(self) -> None:
-        """Manual blackout: every channel to 0 (also the remembered manual state)."""
         for ch in fixture.CHANNELS:
             self.set(ch, 0)
 
-    # ---- who drives the lights
     def acquire(self, source: str) -> None:
-        """`source` takes over the output; it starts dark, manual writes no longer reach the wire."""
         self._owner = source
-        for ch in fixture.CHANNELS:
-            self._live[ch] = 0
+        self.shared.clear_music()
+        self.shared.mode.value = MODE_MUSIC
 
     def release(self, source: str) -> None:
-        """Hands the output back to the manual state."""
         if self._owner != source:
             return
         self._owner = None
-        for ch in fixture.CHANNELS:
-            self._live[ch] = self._manual[ch]
+        self.shared.mode.value = MODE_MANUAL
 
-    # ---- connection
     @property
     def connected(self) -> bool:
-        return self._serial is not None
+        return bool(self.shared.connected.value)
+
+    @property
+    def connecting(self) -> bool:
+        return self._connecting_since is not None
 
     def connect(self, port: str) -> None:
-        """Opens the port (can block -> call from a worker thread) and starts sending. Raises on failure."""
-        if self.connected:
+        if self.connected or self.connecting or self._proc is None:
             return
-        self._serial = serial.Serial(port=port, baudrate=250000, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_TWO)
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._send_loop, args=(self._serial,), daemon=True)
-        self._thread.start()
-        # self.run_test()
-        # todo => go through mult. programms / channels to see connected
+        self._port = port
+        self._connecting_since = time.monotonic()
+        self._cmd_q.put(("connect", port))
 
     def disconnect(self) -> None:
-        """Stops sending, sends one all-zero frame, closes the port."""
-        ser, self._serial = self._serial, None
-        if ser is None:
+        self._port = None
+        self._connecting_since = None
+        if self._proc is not None:
+            self._cmd_q.put(("disconnect",))
+
+    def close(self) -> None:
+        if self._proc is None:
             return
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
-        for ch in range(1, config.UNIVERSE_SIZE):
-            self._live[ch] = 0
         try:
-            self._write_frame(ser)
-            ser.close()
+            self._cmd_q.put(("quit",))
+            self._proc.join(timeout=1.5)
         except Exception:
             pass
+        self._kill_process()
 
-    def _write_frame(self, ser) -> None:
-        # one DMX frame, including break / mark-after-break
-        ser.break_condition = True
-        time.sleep(0.0001)
-        ser.break_condition = False
-        time.sleep(0.000012)
-        ser.write(self._live[:config.SEND_SLOTS])
-
-    def _send_loop(self, ser) -> None:
-        while not self._stop.is_set():
-            try:
-                self._write_frame(ser)
-            except (serial.SerialException, OSError) as error:
-                self._serial = None                    # the link is gone
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-                if self.on_lost is not None:
-                    self.on_lost(error)
-                return
-            self._stop.wait(config.SEND_INTERVAL_S)
-
-
-# Reads & writes channel presets, one JSON file per preset, stored in a folder
 class PresetManager:
     def __init__(self, directory: Path):
         self.directory = directory
         self.directory.mkdir(exist_ok=True)
 
-    def list_presets(self) -> list[str]: # returns preset names (without .json), sorted alphabetically
+    def list_presets(self) -> list[str]:
         return sorted(p.stem for p in self.directory.glob("*.json"))
 
-    def save(self, name: str, values: dict[int, int]) -> None: # writes {channel: value} to <name>.json
+    def save(self, name: str, values: dict[int, int]) -> None:
         path = self.directory / f"{name}.json"
         with path.open("w", encoding="utf-8") as f:
             json.dump(values, f, indent=2)
 
-    def load(self, name: str) -> dict[int, int]: # reads <name>.json back into {channel: value}
+    def load(self, name: str) -> dict[int, int]:
         path = self.directory / f"{name}.json"
         with path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -193,18 +224,14 @@ class PresetManager:
     def delete(self, name: str) -> None:
         (self.directory / f"{name}.json").unlink(missing_ok=True)
 
-
-# Windows-only visual fixes tkinter doesn't handle by itself: DPI awareness (fixes
-# blurry/blocky text on HiDPI displays) and a dark title bar to match the theme.
-# Both are no-ops on non-Windows.
 def enable_dpi_awareness() -> None:
     if not _is_windows():
         return
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         try:
-            ctypes.windll.user32.SetProcessDPIAware()  # fallback for older Windows
+            ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
 
@@ -214,7 +241,7 @@ def apply_dark_titlebar(window) -> None:
         return
     window.update_idletasks()
     hwnd = _user32.GetParent(window.winfo_id())
-    for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (Win10 2004+), 19 (older)
+    for attribute in (20, 19):
         value = ctypes.c_int(1)
         result = _dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value))
         if result == 0:

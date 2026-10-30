@@ -1,42 +1,8 @@
-"""
-DMX Derby Controller
-=====================
-
-Tkinter GUI to control a Razor Derby over a USB-DMX adapter
-(RS485, 250000 baud, 2 stop bits).
-
-Split across these files:
-- fixture.py:    the fixture itself: channel names, device groups, colour tables, value texts, device states
-- controller.py: DMXController (serial link + send thread; the ONE interface both windows write through),
-                 preset persistence, platform helpers
-- config.py:     DMX timing and theme colours
-- theme.py:      every ttk style (colours come from config.py)
-- app.py (this file): main window (DMXUI), dialogs
-- musicmode/:    Music Mode, one job per file
-    config.py        every Music Mode tunable
-    audio_source.py  loopback capture
-    analysis.py      bands, hits, tempo, beat clock
-    engine.py        rules ("when this happens -> do this") -> device states -> DMX frame
-    music_app.py     the Music Mode window
-    nowplaying.py    title / artist / cover (+ NowPlayingBridge.ps1, nowplaying_cache/)
-
-Layout: three device columns (Derby | LED | Laser) with their channels, and a bottom row with the fixture's
-automatic channels (Ch1 / Ch2), the Music Mode entry and the presets.
-
-The entry point does NOT live here but in main.py at the project root --
-this file only provides DMXUI (and the dialog helpers), without starting a
-Tk root/mainloop itself.
-
-Threading model
-----------------
-- Connecting (opening a COM port can block) runs in a worker thread
-- The DMX send cycle runs in the controller's own thread while connected; a lost link is reported back through
-  root.after(...), since Tkinter widgets must only be touched from the main thread
-- This checks the USB link to the adapter, not the DMX cable itself -- DMX512 is unidirectional and gives
-  no feedback from the fixture end.
-"""
-
+# implemented by ai
 import json
+import logging
+import queue
+import sys
 import threading
 
 import serial.tools.list_ports
@@ -55,12 +21,13 @@ class DMXUI:
         self.root.title("DMX Derby Controller")
         self.root.configure(bg=config.COLOR_BG)
 
-        self.ctl = DMXController(on_lost=lambda error: self.root.after(0, self._connection_lost, error))
+        self.ctl = DMXController(on_lost=self._connection_lost, on_connected=self._connected, on_connect_failed=self._connect_failed)
+        self._ports_ready: queue.Queue = queue.Queue()
         self.presets = PresetManager(config.PRESETS_DIR)
         self.channel_labels: dict[int, ttk.Label] = {}
         self.sliders: dict[int, ttk.Scale] = {}
-        self._shown: dict[int, str] = {}                 # text currently shown per channel
-        self._pattern_var = tk.IntVar(value=0)           # LED pattern chips (0 = off)
+        self._shown: dict[int, str] = {}
+        self._pattern_var = tk.IntVar(value=0)
 
         theme.apply_theme(self.root)
         self.root.columnconfigure(0, weight=1)
@@ -68,8 +35,9 @@ class DMXUI:
         self._build_header()
         self._build_body()
         self._size_to_content()
+        self._scan_ports()
+        self._poll()
 
-    # --------- header
     def _build_header(self) -> None:
         bar = ttk.Frame(self.root, padding=(18, 14, 18, 6))
         bar.grid(row=0, column=0, sticky="ew")
@@ -84,7 +52,7 @@ class DMXUI:
         self.conn_label = ttk.Label(controls, text="Disconnected", style="Muted.TLabel", width=16)
         self.conn_label.pack(side="left", padx=(6, 14))
 
-        ports = [p.device for p in serial.tools.list_ports.comports()] or ["COM3", "COM4"]
+        ports = ["COM3", "COM4"] if sys.platform == "win32" else ["/dev/ttyUSB0"]   # until the scan has finished
         self.port_cb = ttk.Combobox(controls, values=ports, width=12, state="readonly")
         self.port_cb.pack(side="left", padx=(0, 8))
         self.port_cb.current(0)
@@ -98,7 +66,6 @@ class DMXUI:
         self.conn_label.config(text=f"Connected  \u00b7  {port}" if connected else "Disconnected")
         self.btn_connect.config(text="Disconnect" if connected else "Connect", state="normal")
 
-    # --------- body: Derby | LED | Laser on top, Automatic | Music Mode | Presets below
     def _build_body(self) -> None:
         grid = ttk.Frame(self.root, padding=(18, 8, 18, 18))
         grid.grid(row=1, column=0, sticky="nsew")
@@ -129,7 +96,6 @@ class DMXUI:
         return card
 
     def _channel_block(self, parent, channel: int) -> ttk.Frame:
-        """Title, readable state and slider of one channel."""
         block = ttk.Frame(parent, style="Plain.Card.TFrame")
         block.columnconfigure(0, weight=1)
         ttk.Label(block, text=fixture.channel_title(channel), style="CellTitle.TLabel").grid(row=0, column=0, sticky="w")
@@ -137,8 +103,7 @@ class DMXUI:
         status.grid(row=1, column=0, sticky="ew", pady=(2, 6))
         self.channel_labels[channel] = status
 
-        slider = ttk.Scale(block, from_=0, to=255, orient="horizontal", style="Card.Horizontal.TScale",
-                           command=lambda v, c=channel: self.on_slider_change(c, v))
+        slider = ttk.Scale(block, from_=0, to=255, orient="horizontal", style="Card.Horizontal.TScale", command=lambda v, c=channel: self.on_slider_change(c, v))
         slider.set(0)
         slider.grid(row=2, column=0, sticky="ew")
         self.sliders[channel] = slider
@@ -154,30 +119,23 @@ class DMXUI:
         for i in range(per_row):
             chips.columnconfigure(i, weight=1, uniform="chips")
         for n in range(1, fixture.PATTERN_COUNT + 1):
-            ttk.Radiobutton(chips, text=str(n), value=n, variable=self._pattern_var, width=3, style="Look.Toolbutton",
-                            command=lambda n=n: self.sliders[channel].set(fixture.pattern_dmx(n))
-                            ).grid(row=(n - 1) // per_row, column=(n - 1) % per_row, sticky="ew", padx=2, pady=2)
-        ttk.Radiobutton(chips, text="Off", value=0, variable=self._pattern_var, style="Look.Toolbutton",
-                        command=lambda: self.sliders[channel].set(0)
-                        ).grid(row=3, column=0, columnspan=per_row, sticky="ew", padx=2, pady=(6, 2))
+            ttk.Radiobutton(chips, text=str(n), value=n, variable=self._pattern_var, width=3, style="Look.Toolbutton", command=lambda n=n: self.sliders[channel].set(fixture.pattern_dmx(n))).grid(row=(n - 1) // per_row, column=(n - 1) % per_row, sticky="ew", padx=2, pady=2)
+        ttk.Radiobutton(chips, text="Off", value=0, variable=self._pattern_var, style="Look.Toolbutton", command=lambda: self.sliders[channel].set(0)).grid(row=3, column=0, columnspan=per_row, sticky="ew", padx=2, pady=(6, 2))
 
     def _build_auto_card(self, parent, row: int, col: int) -> None:
         card = self._card(parent, row, col)
         ttk.Label(card, text="AUTOMATIC PROGRAMS", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(card, text="The fixture's own shows. Select 0 to control the channels yourself.",
-                  style="CardMuted.TLabel", wraplength=300, justify="left").grid(row=1, column=0, sticky="w", pady=(2, 8))
+        ttk.Label(card, text="The fixture's own shows. Select 0 to control the channels yourself.", style="CardMuted.TLabel", wraplength=300, justify="left").grid(row=1, column=0, sticky="w", pady=(2, 8))
         for i, channel in enumerate(fixture.AUTO.channels):
             self._channel_block(card, channel).grid(row=2 + i, column=0, sticky="ew", pady=(0, 6))
 
     def _build_music_card(self, parent, row: int, col: int) -> None:
-        """The whole cell is one big button: hover lights it up, a click opens Music Mode."""
         c = config.ACTIVE_SCHEME
         idle = c["BG_LIGHT"]
         hover = theme.lerp_colour(c["BG_LIGHT"], c["ACCENT"], 0.30)
         pressed = c["ACCENT_DARK"]
 
-        cell = tk.Frame(parent, bg=idle, cursor="hand2", takefocus=1,
-                        highlightthickness=1, highlightbackground=c["LINE"], highlightcolor=c["ACCENT2"])
+        cell = tk.Frame(parent, bg=idle, cursor="hand2", takefocus=1, highlightthickness=1, highlightbackground=c["LINE"], highlightcolor=c["ACCENT2"])
         cell.grid(row=row, column=col, padx=6, pady=5, sticky="nsew")
         cell.columnconfigure(0, weight=1)
         cell.rowconfigure(1, weight=1)
@@ -208,7 +166,7 @@ class DMXUI:
             paint(hover, c["ACCENT"])
 
         def on_leave(event) -> None:
-            if not inside(event):                     # moving between the cell's own labels is not leaving
+            if not inside(event):
                 paint(idle, c["LINE"])
 
         def on_press(_event) -> None:
@@ -239,31 +197,27 @@ class DMXUI:
 
         self.preset_cb = ttk.Combobox(card, values=self.presets.list_presets(), state="readonly")
         self.preset_cb.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 8))
-        if self.preset_cb["values"]:
-            self.preset_cb.current(0)
+        if self.preset_cb["values"]: self.preset_cb.current(0)
 
         ttk.Button(card, text="Load", command=self.load_preset).grid(row=2, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(card, text="Save As...", command=self.save_preset_as).grid(row=2, column=1, sticky="ew", padx=4)
         ttk.Button(card, text="Delete", command=self.delete_preset).grid(row=2, column=2, sticky="ew", padx=(4, 0))
 
     def _size_to_content(self) -> None:
-        # the content decides the minimum size; the window can grow from there and everything scales with it
         self.root.update_idletasks()
         width = self.root.winfo_reqwidth()
         height = self.root.winfo_reqheight()
         self.root.minsize(width, height)
         self.root.geometry(f"{max(width, 1020)}x{max(height, 700)}")
 
-    # --------- Music Mode (same controller as the sliders)
     def _open_music_mode(self) -> None:
         window = MusicModeWindow(self.root, self.ctl, on_closed=self.root.deiconify)
         window.update_idletasks()
         self.root.withdraw()
 
-    # --------- Sliders
     def _show(self, channel: int, value: int) -> None:
         text = fixture.describe(channel, value)
-        if self._shown.get(channel) != text:             # only touch Tk when something changed
+        if self._shown.get(channel) != text:
             self._shown[channel] = text
             self.channel_labels[channel].config(text=text)
         if channel == fixture.CH_LED_PATTERN:
@@ -275,37 +229,61 @@ class DMXUI:
         self.ctl.set(channel, value)
 
     def _sync_sliders(self) -> None:
-        """Moves every slider to the controller's manual state (after a preset load / blackout)."""
         for channel, value in self.ctl.manual_values().items():
             self.sliders[channel].set(value)
             self._show(channel, value)
 
-    # --------- non-blocking connection
+    def _poll(self) -> None:
+        self.root.after(50, self._poll)
+        try:
+            self.ctl.poll()
+            self._poll_ports()
+        except Exception:
+            logging.exception("GUI poll failed")
+
+    def _scan_ports(self) -> None:
+        def scan() -> None:
+            try:
+                self._ports_ready.put([p.device for p in serial.tools.list_ports.comports()])
+            except Exception:
+                logging.exception("Could not list serial ports")
+
+        threading.Thread(target=scan, name="port-scan", daemon=True).start()
+
+    def _poll_ports(self) -> None:
+        try:
+            ports = self._ports_ready.get_nowait()
+        except queue.Empty:
+            return
+        if not ports:
+            return
+        current = self.port_cb.get()
+        self.port_cb["values"] = ports
+        self.port_cb.set(current if current in ports else ports[0])
+
     def toggle_connection(self) -> None:
+        if self.ctl.connecting:
+            return
         if not self.ctl.connected:
             self.btn_connect.config(state="disabled")
-            threading.Thread(target=self._connect_worker, args=(self.port_cb.get(),), daemon=True).start()
+            self.ctl.connect(self.port_cb.get())
         else:
             self.ctl.disconnect()
             self._set_connection_state(False)
 
-    def _connect_worker(self, port: str) -> None:
-        try:
-            self.ctl.connect(port)
-        except Exception as e:
-            self.root.after(0, self._connect_failed, e, port)
-            return
-        self.root.after(0, self._set_connection_state, True, port)
+    def _connected(self, port: str) -> None:
+        self._set_connection_state(True, port)
 
-    def _connect_failed(self, error: Exception, port: str) -> None:
+    def _connect_failed(self, port: str, error: str) -> None:
         self.btn_connect.config(state="normal")
         show_error(self.root, "Error", f"Could not open {port}:\n{error}")
 
-    def _connection_lost(self, error: Exception) -> None:
+    def _connection_lost(self, error: str) -> None:
         self._set_connection_state(False)
+        if self.root.state() == "withdrawn":
+            return
         show_error(self.root, "Connection Lost", f"DMX connection interrupted:\n{error}")
 
-    # --------- presets / blackout
     def refresh_preset_list(self, select: str | None = None) -> None:
         names = self.presets.list_presets()
         self.preset_cb["values"] = names
@@ -348,13 +326,11 @@ class DMXUI:
         self._sync_sliders()
 
     def on_close(self) -> None:
-        self.ctl.disconnect()
+        self.ctl.close()
         self.root.destroy()
 
 
 class ThemedDialog(tk.Toplevel):
-    # Themed popups caz the tkinter.messagebox / simpledialog are boring
-
     def __init__(self, parent: tk.Tk, title: str, message: str, buttons: list[str], with_entry: bool = False):
         super().__init__(parent)
         self.title(title)
@@ -368,9 +344,7 @@ class ThemedDialog(tk.Toplevel):
         self.result: str | None = None
         self.entry_value: str | None = None
 
-        ttk.Label(self, text=message, wraplength=280, justify="left").pack(
-            padx=20, pady=(20, 10)
-        )
+        ttk.Label(self, text=message, wraplength=280, justify="left").pack(padx=20, pady=(20, 10))
 
         if with_entry:
             self.entry = ttk.Entry(self, width=30)
@@ -381,8 +355,7 @@ class ThemedDialog(tk.Toplevel):
         btn_row = ttk.Frame(self)
         btn_row.pack(padx=20, pady=(0, 20))
         for label in buttons:
-            ttk.Button(btn_row, text=label,
-                       command=lambda l=label: self._on_button(l)).pack(side="left", padx=5)
+            ttk.Button(btn_row, text=label, command=lambda l=label: self._on_button(l)).pack(side="left", padx=5)
 
         self.bind("<Escape>", lambda e: self._on_button(None))
         self.protocol("WM_DELETE_WINDOW", lambda: self._on_button(None))

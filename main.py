@@ -1,10 +1,11 @@
-import tkinter as tk
-
-from src import app
-from src.controller import enable_dpi_awareness
-
+import multiprocessing
 
 def main() -> None:
+    import tkinter as tk
+
+    from src import app
+    from src.controller import enable_dpi_awareness
+
     enable_dpi_awareness()
     root = tk.Tk()
     root.protocol("WM_DELETE_WINDOW", app.DMXUI(root).on_close)
@@ -12,4 +13,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
